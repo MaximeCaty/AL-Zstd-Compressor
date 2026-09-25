@@ -7,8 +7,8 @@ This codec writes standard zstd frames, **10-30 % smaller than GZip**. The frame
 decoder, including windows 11 builtin file explorer.
 
 Decomprssor support any zstd produced file up to level up 19.
- - The decomperssor only support window up to 16 MB (zstd level 20+, with option --long or any windowLog above 24)
- - The decompressor does not support custom trained dictionnary
+ - Does not support window above 16 MB (zstd level 20+, option --long or any windowLog above 24)
+ - Does not support custom trained dictionnary
 
 ## Public API
 
