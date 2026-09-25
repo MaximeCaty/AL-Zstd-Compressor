@@ -14,7 +14,8 @@ Decomprssor support any zstd produced file up to level up 19.
 
 | Procedure | Purpose |
 |---|---|
-| `Compress(var Source: InStream; var Target: OutStream; Level: Enum "TOO ZSTD Level")` | Writes one zstd frame (content size set, no checksum, no dictionary, window up to 16 MB). |
+| `Compress(var Source: InStream; var Target: OutStream; Level: Enum "TOO ZSTD Level")` | Writes one zstd frame (content size set, no checksum, no dictionary, window up to 16 MB), with the `General` profile. |
+| `Compress(var Source: InStream; var Target: OutStream; Level: Enum "TOO ZSTD Level"; Profile: Enum "TOO ZSTD Profile")` | Same, with an explicit profile: `General` (any file) or `ColumnData` (column-oriented table exports). |
 | `Decompress(var Source: InStream; var Target: OutStream)` | Reads any standard stream: concatenated or skippable frames, raw, RLE or compressed blocks, every FSE table mode. Does not verify the checksum, so the caller checks integrity. |
 | `SetTuning(...)` | Benchmarks only. Overrides the parser settings for the **next** `Compress` call; `-1` keeps the level default. |
 
@@ -22,9 +23,35 @@ Decomprssor support any zstd produced file up to level up 19.
 var
     Zstd: Codeunit "TOO ZSTD Data Compression";
 begin
-    Zstd.Compress(InStr, OutStr, Enum::"TOO ZSTD Level"::Medium);
+    Zstd.Compress(InStr, OutStr, Enum::"TOO ZSTD Level"::Medium);                                         // any file
+    Zstd.Compress(InStr, OutStr, Enum::"TOO ZSTD Level"::Medium, Enum::"TOO ZSTD Profile"::ColumnData);   // table exports
     Zstd.Decompress(ZInStr, OutStr);
 ```
+
+The profile picks the parser settings behind each level. Both write standard frames, and `Decompress` reads either.
+
+- **ColumnData**: the settings tuned on binary, column-oriented exports of SQL table data (table below). On general files
+  it is weak on small inputs: +0 to +4 % over GZip below 64 KB.
+- **General** (default): tuned on general files (JSON, XML, CSV, text, source code, PDF, a binary database, enwik8). The
+  best hashed length depends on the input size, not its type:
+  - up to 64 KB: 4-byte hash chains; up to 256 KB: 5-byte. Lazy parse at every level with a deep search (Fast 8, Medium
+    32, Heavy 128 candidates and 2 lazy steps), no LDM. A small input costs little in absolute time.
+  - above 256 KB: the ColumnData strategies with a 4-byte short hash (Fast), 16 candidates and 3 repeat checks (Medium),
+    24 candidates and 2 lazy steps (Heavy): about +6 to +10 % encode time.
+
+Size vs GZip on general files (C# port, `bench/`), General / ColumnData:
+
+| Input | Fast | Medium | Heavy |
+|---|---|---|---|
+| up to 64 KB | -0.7 / +4.2 % | -2.0 / +0.9 % | -2.4 / +0.2 % |
+| 64-256 KB | -3.7 / +2.3 % | -5.5 / -3.4 % | -6.2 / -4.7 % |
+| above 256 KB | -3.8 / -3.0 % | -12.4 / -10.9 % | -13.3 / -12.6 % |
+| enwik8 (100 MB) | -3.9 / -2.9 % | -11.8 / -10.8 % | -12.5 / -12.0 % |
+
+PDFs whose streams are already deflated gain 0-2 % at any setting. Below 32 KB, even reference zstd -15 is only ~3 % smaller
+than GZip.
+
+ColumnData profile:
 
 | Level | Strategy (zstd equivalent) | Size vs GZip | Encode 10.4 MB (MB/s) |
 |---|---|---|---|
