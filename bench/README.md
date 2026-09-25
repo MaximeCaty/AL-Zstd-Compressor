@@ -33,3 +33,11 @@ dotnet bench/ZstdAlPort/bin/Release/net8.0/ZstdAlPort.dll --tune configs.txt --s
 The ColumnData profile was checked byte for byte against the first version of this port (168 frames, 3 levels).
 
 Requirements: .NET 8 SDK; `zstd` on the PATH for verification and reference sizes (optional).
+
+## bzip2 thought experiment (`Bz2Al.cs`)
+
+`--bzip2 <file or dir>... [--iters N] [--stmt-ns X]` runs a bzip2 encoder and decoder written as they would be in pure AL
+(no bit operators, arrays of at most 1M elements, 2 bytes per append), counting the AL statements each stage would run.
+Streams are checked with `bzip2 -d` and with the port's own decoder. On the 54 MB corpus at 20 ns / statement: size
+-22.1 % vs GZip (zstd Heavy -13.3 %), encode ~3.3 s/MB (SA-IS 1.45, MTF 0.77), decode ~0.8 s/MB, about 12x / 20x
+slower than the zstd codec.
