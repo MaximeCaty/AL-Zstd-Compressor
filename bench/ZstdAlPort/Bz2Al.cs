@@ -26,6 +26,7 @@ public sealed class Bz2Al
     public readonly long[] St = new long[14];
     public long EncAppends, DecAppends;
     public int NIters = 4;
+    public bool NoMtf; // experiment : BWT bytes coded directly (runs of the previous byte as RUNA / RUNB), not bzip2-decodable
     public int BlockMax = 900000 - 19;
 
     static readonly uint[] CrcTbl = MakeCrc();
@@ -165,9 +166,9 @@ public sealed class Bz2Al
         var unseqToSeq = new int[256];
         int nInUse = 0;
         for (int x = 0; x < 256; x++) if (inUse[x]) unseqToSeq[x] = nInUse++;
-        int alphaSize = nInUse + 2, EOB = nInUse + 1;
+        int alphaSize = NoMtf ? nInUse + 3 : nInUse + 2, EOB = NoMtf ? nInUse + 2 : nInUse + 1;
         var mtfv = new int[n + 1];
-        var mtfFreq = new int[258];
+        var mtfFreq = new int[260];
         var yy = new int[256];
         for (int x = 0; x < nInUse; x++) yy[x] = x;
         int nMTF = 0, zPend = 0;
@@ -175,6 +176,13 @@ public sealed class Bz2Al
         {
             int ll = unseqToSeq[L[x]];
             St[SMtf] += 2;
+            if (NoMtf)
+            {
+                if (yy[0] == ll && x > 0) { zPend++; continue; }
+                if (zPend > 0) { nMTF = PutRun(mtfv, mtfFreq, nMTF, zPend); zPend = 0; }
+                yy[0] = ll; mtfv[nMTF++] = ll + 2; mtfFreq[ll + 2]++;
+                continue;
+            }
             if (yy[0] == ll) { zPend++; St[SMtf]++; }
             else
             {
@@ -194,7 +202,7 @@ public sealed class Bz2Al
 
         // --- Huffman tables (bzip2 sendMTFValues)
         int nGroups = nMTF < 200 ? 2 : nMTF < 600 ? 3 : nMTF < 1200 ? 4 : nMTF < 2400 ? 5 : 6;
-        var len = new int[nGroups, 258];
+        var len = new int[nGroups, 260];
         {
             int nPart = nGroups, remF = nMTF, gs = 0;
             while (nPart > 0)
@@ -208,7 +216,7 @@ public sealed class Bz2Al
         }
         int nSelectors = (nMTF + 49) / 50;
         var selector = new int[nSelectors];
-        var rfreq = new int[nGroups, 258];
+        var rfreq = new int[nGroups, 260];
         var cost = new int[6];
         for (int iter = 0; iter < NIters; iter++)
         {
@@ -234,7 +242,7 @@ public sealed class Bz2Al
             for (int t = 0; t < nGroups; t++) MakeCodeLengths(len, rfreq, t, alphaSize, 17);
         }
         // codes (canonical, as bzip2 assignCodes)
-        var code = new int[nGroups, 258];
+        var code = new int[nGroups, 260];
         for (int t = 0; t < nGroups; t++)
         {
             int minL = 32, maxL = 0;
@@ -317,9 +325,9 @@ public sealed class Bz2Al
 
     void MakeCodeLengths(int[,] len, int[,] freq, int t, int alphaSize, int maxLen)
     {
-        var heap = new int[260];
-        var weight = new int[516];
-        var parent = new int[516];
+        var heap = new int[264];
+        var weight = new int[530];
+        var parent = new int[530];
         long stc = 0;
         for (int i = 0; i < alphaSize; i++) weight[i + 1] = (freq[t, i] == 0 ? 1 : freq[t, i]) << 8;
         stc += alphaSize * 2;
@@ -511,7 +519,7 @@ public sealed class Bz2Al
                 while (v > 0) { pos[v] = pos[v - 1]; v--; }
                 pos[0] = tmp; selector[x] = tmp;
             }
-            var len = new int[nGroups, 258];
+            var len = new int[nGroups, 260];
             for (int t = 0; t < nGroups; t++)
             {
                 int curr = BsR(5);

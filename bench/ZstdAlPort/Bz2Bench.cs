@@ -13,14 +13,16 @@ public static class Bz2Bench
     {
         double stmtNs = 20, appendNs = 70;
         int iters = 4;
+        bool noMtf = false;
         var paths = new List<string>();
         for (int i = 0; i < args.Length; i++)
             if (args[i] == "--iters") iters = int.Parse(args[++i]);
+            else if (args[i] == "--no-mtf") noMtf = true;
             else if (args[i] == "--stmt-ns") stmtNs = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
             else paths.Add(args[i]);
         var files = paths.SelectMany(p => Directory.Exists(p) ? Directory.GetFiles(p).OrderBy(f => f).ToArray() : new[] { p }).ToList();
 
-        var bz = new Bz2Al { NIters = iters };
+        var bz = new Bz2Al { NIters = iters, NoMtf = noMtf };
         var zenc = new ZstdAlEncoder();
         var zMed = new Stats(); var zHeavy = new Stats();
         long raw = 0, gzT = 0, bzT = 0, zmT = 0, zhT = 0;
@@ -30,8 +32,8 @@ public static class Bz2Bench
             var d = File.ReadAllBytes(f);
             var before = (long[])bz.St.Clone(); long ea = bz.EncAppends, da = bz.DecAppends;
             var z = bz.Compress(d);
-            if (!Native(z).AsSpan().SequenceEqual(d)) throw new Exception("bzip2 -d mismatch " + f);
-            if (!bz.Decompress(z).AsSpan().SequenceEqual(d)) throw new Exception("own decoder mismatch " + f);
+            if (!noMtf && !Native(z).AsSpan().SequenceEqual(d)) throw new Exception("bzip2 -d mismatch " + f);
+            if (!noMtf && !bz.Decompress(z).AsSpan().SequenceEqual(d)) throw new Exception("own decoder mismatch " + f);
             long gz = Gz(d);
             long zm = zenc.Compress(d, ZstdLevel.Medium).Length; zMed.Add(zenc.Stats);
             long zh = zenc.Compress(d, ZstdLevel.Heavy).Length; zHeavy.Add(zenc.Stats);
