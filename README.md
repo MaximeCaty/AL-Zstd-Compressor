@@ -39,27 +39,17 @@ The profile picks the parser settings behind each level. Both write standard fra
   - above 256 KB: the ColumnData strategies with a 4-byte short hash (Fast), 16 candidates and 3 repeat checks (Medium),
     24 candidates and 2 lazy steps (Heavy): about +6 to +10 % encode time.
 
-Size vs GZip on general files (C# port, `bench/`), General / ColumnData:
+Size vs GZip on general files, General profile :
 
 | Input | Fast | Medium | Heavy |
 |---|---|---|---|
-| up to 64 KB | -0.7 / +4.2 % | -2.0 / +0.9 % | -2.4 / +0.2 % |
-| 64-256 KB | -3.7 / +2.3 % | -5.5 / -3.4 % | -6.2 / -4.7 % |
-| above 256 KB | -3.8 / -3.0 % | -12.4 / -10.9 % | -13.3 / -12.6 % |
-| enwik8 (100 MB) | -3.9 / -2.9 % | -11.8 / -10.8 % | -12.5 / -12.0 % |
+| up to 64 KB | -0.7 % | -2.0 % | -2.4 % |
+| 64-256 KB | -3.7 % | -5.5 % | -6.2 % |
+| above 256 KB | -3.8 % | -12.4 % | -13.3 % |
+| enwik8 (100 MB) | -3.9 % | -11.8 % | -12.5 % |
 
 PDFs whose streams are already deflated gain 0-2 % at any setting. Below 32 KB, even reference zstd -15 is only ~3 % smaller
 than GZip.
-
-ColumnData profile:
-
-| Level | Strategy (zstd equivalent) | Size vs GZip | Encode 10.4 MB (MB/s) |
-|---|---|---|---|
-| Fast | Double fast parse, 8-byte and 5-byte hash tables, no chains (zstd 3-4) | -0 to -5 % | ~800 ms (~13) |
-| Medium | Lazy parse (1 step) on 6-byte hash chains, depth 8, gzip -6 style limits, plus LDM (zstd ~5) | -5 to -10 % | ~1350 ms (~7.7) |
-| Heavy | Full lazy search, 16 candidates, plus LDM (zstd ~9) | -10 to -15 % | ~1700 ms (~6.1) |
-
-Decoding takes 320-470 ms (22-32 MB/s) at every level. All levels encode more slowly than GZip; the codec trades speed for size.
 
 **Limits:**
 - The whole input is held in memory as Text (2 bytes per byte), so chunk large inputs before calling.
