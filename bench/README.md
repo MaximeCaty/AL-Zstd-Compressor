@@ -41,3 +41,13 @@ Requirements: .NET 8 SDK; `zstd` on the PATH for verification and reference size
 Streams are checked with `bzip2 -d` and with the port's own decoder. On the 54 MB corpus at 20 ns / statement: size
 -22.1 % vs GZip (zstd Heavy -13.3 %), encode ~3.3 s/MB (SA-IS 1.45, MTF 0.77), decode ~0.8 s/MB, about 12x / 20x
 slower than the zstd codec.
+
+## BWT-lite experiments
+
+- `--bwtlite <files>`: size-only comparison of ways to code a BWT column (no MTF, bounded move-to-front of the last K
+  bytes, full MTF, 16-bit symbols).
+- `--bwtl <files> [--k K] [--iters N] [--maxlen M]` (`BwtLiteAl.cs`): an own-format BWT codec written AL-style, with an
+  encoder, a decoder and a round-trip check. It uses a sentinel BWT (no rotation search, RLE1 or CRC), runs and a K-entry
+  recency list, and bzip2 multi-table Huffman. The decoder fills Next during decoding (1 statement per run byte) and walks
+  it 2 bytes per append. Corpus result (K = 16): -21.4 % vs GZip (bzip2 -22.1 %, zstd Heavy -13.3 %), encode ~2.1 s/MB,
+  decode ~0.34 s/MB (0.17-0.43 on compressible files).

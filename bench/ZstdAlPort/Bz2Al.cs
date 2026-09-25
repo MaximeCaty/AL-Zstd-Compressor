@@ -388,6 +388,9 @@ public sealed class Bz2Al
         return c;
     }
 
+    /// <summary>Suffix array of s (s[^1] = 0 unique smallest, values 0..K) : SA-IS below, statements counted in St.</summary>
+    public void SuffixArray(int[] s, int[] sa, int K) => Sais(s, 0, sa, 0, s.Length, K, 0);
+
     // ------------------------------------------------------------------------------------------------- SA-IS
     // Nong-Zhang-Chan SA-IS, s[sOff .. sOff + n - 1], s[last] = 0 unique smallest ; SA[saOff ..]. Recursion keeps s1 at the
     // end of SA (as in the paper) ; in AL : SA / s as global arrays with offsets, t / buckets as local arrays.
