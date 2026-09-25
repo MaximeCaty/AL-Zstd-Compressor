@@ -16,6 +16,8 @@ namespace ZstdAlPort;
 
 public enum ZstdLevel { Fast = 0, Medium = 1, Heavy = 2 }
 
+public enum ZstdProfile { General = 0, ColumnData = 1 }
+
 public sealed class Stats
 {
     public long Inserts;     // chain insertions (ParseLazy) / table writes (ParseDoubleFast)
@@ -23,8 +25,10 @@ public sealed class Stats
     public long Candidates;  // chain candidates visited / double fast candidates tried
     public long Bytes;       // per-byte match extension steps
     public long RawBytes;
+    // entropy stage breakdown (emitted compressed blocks) : sizes in bytes, ideal = order-0 Shannon bits
+    public long Blocks, Lits, LitBytes, Seqs, SeqHdrBytes, SeqBytes; public double LitIdealBits, SeqIdealBits;
 
-    public void Add(Stats o) { Inserts += o.Inserts; Positions += o.Positions; Candidates += o.Candidates; Bytes += o.Bytes; RawBytes += o.RawBytes; }
+    public void Add(Stats o) { Blocks += o.Blocks; Lits += o.Lits; LitBytes += o.LitBytes; Seqs += o.Seqs; SeqHdrBytes += o.SeqHdrBytes; SeqBytes += o.SeqBytes; LitIdealBits += o.LitIdealBits; SeqIdealBits += o.SeqIdealBits; Inserts += o.Inserts; Positions += o.Positions; Candidates += o.Candidates; Bytes += o.Bytes; RawBytes += o.RawBytes; }
 
     /// <summary>README time model, AL ms for the counted input.</summary>
     public double EstimatedAlMs()
@@ -41,6 +45,8 @@ public sealed class Tuning
 {
     public int MinMatch = -1, SearchDepth = -1, LazyDepth = -1, LdmMinInput = -1, MaxInsertLen = -1, MaxLazyLen = -1, NiceLen = -1;
     public bool SkipRunInsert;
+    // experiment knobs (not in the AL SetTuning) : -1 = level default
+    public int RepChecks = -1, SpeedMode = -1, DfShortMul = -1, Ldm = -1; // DfShortMul : 1 = 5-byte short hash, 0 = 4-byte
 }
 
 public sealed class ByteBuilder
@@ -85,6 +91,8 @@ public sealed class ZstdAlEncoder
     bool DoubleFast;
     readonly int[] DfLong = new int[524289], DfShort = new int[524289];
     bool SpeedMode;
+    int RepCheckCount; // repeat offsets tried per search (ParseLazy)
+    long DfShortMul; // ParseDoubleFast short hash : 2^32 = 5 bytes (VS + low byte of VL), 0 = 4 bytes (VS)
     int MinMatch; long HashMul; int LdmMinInput, MaxInsertLen, MaxLazyLen, NiceLen; bool SkipRunInsert;
     Tuning Tune;
     readonly int[] HBTbl = new int[1025];
@@ -120,13 +128,13 @@ public sealed class ZstdAlEncoder
     public void SetTuning(Tuning t) => Tune = t;
 
     // ======================================================================================== Compress
-    public byte[] Compress(byte[] input, ZstdLevel level)
+    public byte[] Compress(byte[] input, ZstdLevel level, ZstdProfile profile = ZstdProfile.General)
     {
         bool singleSegment;
         Stats = new Stats { RawBytes = input.Length };
-        ApplyLevel(level);
         InitTables();
         InLen = input.Length;
+        ApplyLevel(level, profile);
         T = new byte[InLen + 2 + 64]; // [0] unused, [InLen + 1] guard char ; extra zeros never read by the AL paths
         Buffer.BlockCopy(input, 0, T, 1, InLen);
         if (PosBase > 2000000000 - InLen)
@@ -201,7 +209,16 @@ public sealed class ZstdAlEncoder
         for (int s = 0; s < v.Length; s++) NormCount[s + 1] = v[s];
     }
 
-    void ApplyLevel(ZstdLevel level)
+    /// <summary>
+    /// Parser settings behind each level and profile.
+    /// ColumnData : the settings tuned on column-oriented table exports (unchanged, see the AL ApplyLevel comment).
+    /// General (default) : tuned on general files (JSON, XML, CSV, text, source, PDF, enwik8) by input size, because the
+    /// best hashed length depends on how many chain candidates compete :
+    ///   <= 64 KB : MinMatch 4 ; <= 256 KB : MinMatch 5 (both : deep search, cheap in absolute time, no LDM) ;
+    ///   larger : MinMatch 6 like ColumnData, Fast with a 4-byte short hash, Medium depth 16 + 3 repeat checks,
+    ///   Heavy depth 24 + lazy 2.
+    /// </summary>
+    void ApplyLevel(ZstdLevel level, ZstdProfile profile)
     {
         WindowLog = 24;
         SearchDepth = 16;
@@ -209,6 +226,7 @@ public sealed class ZstdAlEncoder
         MinMatch = 6;
         LdmMinInput = 0;
         SkipRunInsert = false;
+        DfShortMul = 4294967296L;
         switch (level)
         {
             case ZstdLevel.Fast: MaxStage = 6; DoubleFast = true; SpeedMode = true; break;
@@ -218,6 +236,31 @@ public sealed class ZstdAlEncoder
         }
         if (SpeedMode) { MaxInsertLen = 32; MaxLazyLen = 32; NiceLen = 128; }
         else { MaxInsertLen = 128; MaxLazyLen = 0; NiceLen = 0; }
+        RepCheckCount = SpeedMode ? 1 : 3;
+        if (profile == ZstdProfile.General)
+        {
+            if (InLen <= 262144)
+            {
+                // small input : lazy parse at every level, no LDM (the chains reach the whole input)
+                MaxStage = 6;
+                DoubleFast = false;
+                RepCheckCount = 3;
+                MinMatch = InLen <= 65536 ? 4 : 5;
+                switch (level)
+                {
+                    case ZstdLevel.Fast: SpeedMode = true; SearchDepth = 8; SkipRunInsert = true; MaxInsertLen = 32; MaxLazyLen = 32; NiceLen = 128; break;
+                    case ZstdLevel.Medium: SpeedMode = false; SearchDepth = 32; MaxInsertLen = 128; MaxLazyLen = 0; NiceLen = 0; break;
+                    case ZstdLevel.Heavy: SearchDepth = 128; LazyDepth = 2; break;
+                }
+            }
+            else
+                switch (level)
+                {
+                    case ZstdLevel.Fast: DfShortMul = 0; break;
+                    case ZstdLevel.Medium: SearchDepth = 16; RepCheckCount = 3; MaxLazyLen = 0; NiceLen = 0; break;
+                    case ZstdLevel.Heavy: SearchDepth = 24; LazyDepth = 2; break;
+                }
+        }
         if (Tune != null) ApplyTuning();
         HashMul = 1;
         for (int i = 2; i <= MinMatch; i++) HashMul *= 256;
@@ -234,6 +277,10 @@ public sealed class ZstdAlEncoder
         if (t.MaxLazyLen >= 0) MaxLazyLen = t.MaxLazyLen;
         if (t.NiceLen >= 0) NiceLen = t.NiceLen;
         SkipRunInsert = t.SkipRunInsert;
+        if (t.RepChecks >= 0) RepCheckCount = t.RepChecks;
+        if (t.SpeedMode >= 0) SpeedMode = t.SpeedMode == 1;
+        if (t.DfShortMul >= 0) DfShortMul = t.DfShortMul * 4294967296L;
+        if (t.Ldm >= 0) MaxStage = t.Ldm == 1 ? 7 : 6;
         if (MinMatch < 4 || MinMatch > 6 || SearchDepth < 1 || LazyDepth > 2 || (MaxInsertLen > 0 && MaxInsertLen < 8) || (NiceLen > 0 && NiceLen < 4))
             throw new ArgumentException("Invalid zstd compression settings.");
     }
@@ -303,8 +350,13 @@ public sealed class ZstdAlEncoder
             BlockTB.Clear();
             WriteLiteralsRaw();
         }
+        int litBytes = BlockTB.Length;
         WriteSequences();
         if (BlockTB.Length >= size) return false;
+        Stats.Blocks++; Stats.Lits += LitCount; Stats.LitBytes += litBytes; Stats.Seqs += NbSeq;
+        Stats.SeqBytes += BlockTB.Length - litBytes; Stats.SeqHdrBytes += SeqHdrEnd - litBytes;
+        Stats.LitIdealBits += Entropy(Lit, 1, LitCount);
+        if (NbSeq > 0) Stats.SeqIdealBits += SeqIdeal();
         PutBlockHeader(lastBlock, 2, BlockTB.Length);
         OutTB.Append(BlockTB.ToArray());
         Rep1 = PRep1; Rep2 = PRep2; Rep3 = PRep3;
@@ -360,8 +412,7 @@ public sealed class ZstdAlEncoder
         bool Lazy = false, Emit;
         Reach = WindowSize;
         if (Reach > 999999) Reach = 999999;
-        RepChecks = 3;
-        if (SpeedMode) RepChecks = 1;
+        RepChecks = RepCheckCount;
         while (Pos + 4 <= BlockEnd)
         {
             Stats.Positions++;
@@ -549,7 +600,7 @@ public sealed class ZstdAlEncoder
                 for (int k = 8; k >= 5; k--) { C = T[Pos + k]; VL = VL * 256 + C; }
             }
             VPos = Pos;
-            HS = (int)(((((VS + (VL % 256) * 4294967296L) % 4294967291L) * 506832829) % 4294967296L) / 8192);
+            HS = (int)(((((VS + (VL % 256) * DfShortMul) % 4294967291L) * 506832829) % 4294967296L) / 8192);
             HL = (int)((((VL * 1640531527) % 4294967296L + VS * 2654435) % 4294967296L) / 8192);
             CandL = DfLong[HL + 1] - 1 - PosBase;
             CandS = DfShort[HS + 1] - 1 - PosBase;
@@ -625,7 +676,7 @@ public sealed class ZstdAlEncoder
                         for (int j = 4; j >= 1; j--) { C = T[P + j]; VS = VS * 256 + C; }
                         VL = 0;
                         for (int j = 8; j >= 5; j--) { C = T[P + j]; VL = VL * 256 + C; }
-                        HS = (int)(((((VS + (VL % 256) * 4294967296L) % 4294967291L) * 506832829) % 4294967296L) / 8192);
+                        HS = (int)(((((VS + (VL % 256) * DfShortMul) % 4294967291L) * 506832829) % 4294967296L) / 8192);
                         HL = (int)((((VL * 1640531527) % 4294967296L + VS * 2654435) % 4294967296L) / 8192);
                         DfLong[HL + 1] = P + 1 + PosBase;
                         DfShort[HS + 1] = P + 1 + PosBase;
@@ -1072,6 +1123,7 @@ public sealed class ZstdAlEncoder
                 case 1: PutBlockByte(SlotRleSym[slot]); break;
                 case 2: LoadSlotNorm(slot); BwAcc = 0; BwCount = 0; WriteNCount(SlotMax[slot], SlotTL[slot]); break;
             }
+        SeqHdrEnd = BlockTB.Length;
         rleLL = SlotMode[1] == 1;
         rleOF = SlotMode[2] == 1;
         rleML = SlotMode[3] == 1;
@@ -1127,6 +1179,24 @@ public sealed class ZstdAlEncoder
         if (!rleOF) FseFlushState(2, stateOF);
         if (!rleLL) FseFlushState(1, stateLL);
         BitCloseStream();
+    }
+
+    int SeqHdrEnd;
+    static double Entropy(byte[] a, int start, int count)
+    {
+        var h = new int[256];
+        for (int i = start; i < start + count; i++) h[a[i]]++;
+        double bits = 0;
+        foreach (var c in h) if (c > 0) bits -= c * Math.Log2((double)c / count);
+        return bits;
+    }
+    double SeqIdeal()
+    {
+        double bits = 0;
+        for (int slot = 0; slot < 3; slot++)
+            for (int c = 0; c < 64; c++) { int k = SeqHist[slot * 64 + c + 1]; if (k > 0) bits -= k * Math.Log2((double)k / NbSeq); }
+        for (int n = 1; n <= NbSeq; n++) bits += LLBits[SeqLLCode[n] + 1] + MLBits[SeqMLCode[n] + 1] + SeqOFCode[n];
+        return bits;
     }
 
     void FlushBits()

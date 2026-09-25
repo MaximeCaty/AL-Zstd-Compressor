@@ -1,13 +1,20 @@
 /*
     Pure-AL zStandard codec (RFC 8878), SaaS safe : no custom DotNet, no file system.
     Public API :
-    - Compress(Source, Target, Level) : one standard zstd frame (content size, no checksum, no dictionary, window up to
-      16 MB), readable by any zstd decoder. Levels (enum "TOO ZSTD Level") :
+    - Compress(Source, Target, Level [, Profile]) : one standard zstd frame (content size, no checksum, no dictionary,
+      window up to 16 MB), readable by any zstd decoder. Profile (enum "TOO ZSTD Profile", default General) picks the
+      parser settings behind each level (see ApplyLevel) :
+      ColumnData : column-oriented table exports. Levels (enum "TOO ZSTD Level") :
         Fast   (-5% over gz)   : zstd levels 3-4 strategy : double fast parse (2 hash tables of 8 and 5 bytes, no chains)
         Medium (-10% over gz)  : zstd levels ~5 + long-distance matching : lazy parse on 6-byte hash chains (8 candidates) with
                                  gzip -6 style limits (speed mode)
         Heavy  (-15% over gz)  : zstd levels ~9 + long-distance matching : full lazy search (6-byte hash, 16 chain candidates,
                                  1 lazy step)
+      General : general files (text, JSON, XML, CSV, PDF...). Up to 256 KB : lazy parse at every level on 4-byte (<= 64 KB)
+        or 5-byte hash chains, deep search (Fast 8, Medium 32, Heavy 128 candidates + 2 lazy steps), no long-distance
+        matching. Larger inputs : ColumnData strategies with a 4-byte short hash (Fast), 16 candidates and 3 repeat checks
+        (Medium), 24 candidates and 2 lazy steps (Heavy).
+        Size vs gz on general files : Fast -4%, Medium -12%, Heavy -13% (files <= 256 KB : -1 to -7%).
     - Decompress(Source, Target) : any standard zstd stream : concatenated / skippable frames, raw, RLE and compressed
       blocks, Huffman literals, all FSE table modes, windows up to 16 MB ; no dictionary, checksum skipped (the caller
       checks integrity).
@@ -135,6 +142,8 @@ codeunit 51150 "TOO ZSTD Data Compression"
         MaxLazyLen: Integer; // no lazy step after a match this long (gzip max_lazy)
         NiceLen: Integer; // a match this long ends the chain search (gzip nice_length)
         SkipRunInsert: Boolean; // speed mode skip-ahead also skips indexing the skipped positions (zstd fast)
+        RepCheckCount: Integer; // repeat offsets tried per lazy search : 1 (zstd lazy speed mode) or 3
+        DfShortMul: BigInteger; // double fast short hash : 2^32 = 5 bytes (VS + low byte of VL), 0 = 4 bytes (VS only)
         TuneActive: Boolean;
         TuneMinMatch: Integer;
         TuneSearchDepth: Integer;
@@ -211,7 +220,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
     /// defaults apply again. -1 = keep the level default. MinMatch 4..6 (hashed bytes), SearchDepth >= 1 (chain
     /// candidates), LazyDepth 0..2 (0 = greedy), LdmMinInput (long-distance matching only when the input is larger ; 999999 =
     /// only when the chains cannot reach the whole input), MaxInsertLen / MaxLazyLen / NiceLen (0 = off), SkipRunInsert.
-    /// Any override may change the bytes written (still standard zstd).
+    /// Overrides apply on top of the level and profile settings. Any override may change the bytes written (still standard zstd).
     /// </summary>
     procedure SetTuning(NewMinMatch: Integer; NewSearchDepth: Integer; NewLazyDepth: Integer; NewLdmMinInput: Integer; NewMaxInsertLen: Integer; NewMaxLazyLen: Integer; NewNiceLen: Integer; NewSkipRunInsert: Boolean)
     begin
@@ -226,15 +235,24 @@ codeunit 51150 "TOO ZSTD Data Compression"
         TuneSkipRunInsert := NewSkipRunInsert;
     end;
 
-    /// <summary>Compresses Source into one zstd frame written to Target.</summary>
+    /// <summary>Compresses Source into one zstd frame written to Target, with the General profile.</summary>
     procedure Compress(var Source: InStream; var Target: OutStream; Level: Enum "TOO ZSTD Level")
+    begin
+        Compress(Source, Target, Level, Enum::"TOO ZSTD Profile"::General);
+    end;
+
+    /// <summary>
+    /// Compresses Source into one zstd frame written to Target. Profile : General (any file) or ColumnData (column-oriented
+    /// table exports, the settings of the company data import / export tool).
+    /// </summary>
+    procedure Compress(var Source: InStream; var Target: OutStream; Level: Enum "TOO ZSTD Level"; Profile: Enum "TOO ZSTD Profile")
     var
         SingleSegment: Boolean;
     begin
-        ApplyLevel(Level);
         InitTables();
         InitLatin1();
         ReadInput(Source);
+        ApplyLevel(Level, Profile); // after ReadInput : the General profile depends on InLen
         // guard char past the input (InLen unchanged) : match loops read one char past BlockEnd without a bound test
         InText += CharTbl[1];
         // match tables : stale entries of earlier calls are negative after the PosBase shift ; clear only near overflow
@@ -1429,8 +1447,9 @@ codeunit 51150 "TOO ZSTD Data Compression"
     ///   Heavy  lazy 1, MinMatch 6, depth 16, max insert 128 140.5 MB, ~229 ms/MB (old MinMatch 4 : 143.6 MB, 257 ms/MB)
     /// Measured and rejected : greedy Medium (150.1 MB : barely below Fast), LDM only above 1 MB (LDM matches spare the lazy
     /// parse), Heavy max insert / max lazy / nice limits, depth 24-32 (-0.5 to -0.9 % size for +7 to +13 % time).
+    /// These are the ColumnData profile ; the General profile adjusts them in ApplyGeneralProfile.
     /// </summary>
-    local procedure ApplyLevel(Level: Enum "TOO ZSTD Level")
+    local procedure ApplyLevel(Level: Enum "TOO ZSTD Level"; Profile: Enum "TOO ZSTD Profile")
     var
         I: Integer;
     begin
@@ -1440,6 +1459,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
         MinMatch := 6; // hashed bytes = shortest chain match ; 6 beats 5 in size AND time on column exports
         LdmMinInput := 0;
         SkipRunInsert := false;
+        DfShortMul := 4294967296L; // 5-byte short hash
         case Level of
             Level::Fast:
                 begin
@@ -1473,11 +1493,89 @@ codeunit 51150 "TOO ZSTD Data Compression"
             MaxLazyLen := 0;
             NiceLen := 0;
         end;
+        if SpeedMode then
+            RepCheckCount := 1
+        else
+            RepCheckCount := 3;
+        if Profile = Profile::General then
+            ApplyGeneralProfile(Level)
+        else
+            if Profile <> Profile::ColumnData then
+                Error(SettingsErr);
         if TuneActive then
             ApplyTuning();
         HashMul := 1;
         for I := 2 to MinMatch do
             HashMul *= 256;
+    end;
+
+    /// <summary>
+    /// General profile (default) : chosen 2026-09-25 with the C# port (bench/ZstdAlPort) on general files : JSON, XML, CSV,
+    /// text, source code, PDF, a binary database and enwik8, whole files and 8 / 32 / 128 / 256 KB slices, against .NET GZip
+    /// (= GZipCompress). The best hashed length depends on the input size, not its type : on a small input, few candidates
+    /// compete in a chain and short matches pay ; on a large one, short matches crowd the chain and hide the long ones.
+    ///   <= 64 KB  : MinMatch 4 ; <= 256 KB : MinMatch 5 (crossover with 6 at ~256 KB). Lazy parse at every level (double
+    ///               fast is +3 to +5 % over gz on small files), 3 repeat checks, deep search : a small input costs little
+    ///               in absolute time (32 KB at ~300 ms / MB = 10 ms). No LDM : the chains reach the whole input, and LDM
+    ///               matches cost 0.1-0.2 % size there. Fast : speed mode, 8 candidates ; Medium : full search, 32
+    ///               candidates ; Heavy : 128 candidates, 2 lazy steps.
+    ///               Size vs gz, <= 64 KB / 64-256 KB : Fast -0.7 / -3.7 %, Medium -2.0 / -5.5 %, Heavy -2.4 / -6.2 %
+    ///               (ColumnData : +4.2 / +2.3 %, +0.9 / -3.4 %, +0.2 / -4.7 %).
+    ///   > 256 KB  : ColumnData settings plus Fast 4-byte short hash (-3.8 % over gz vs -3.0 %, ~+6 % time), Medium 16
+    ///               candidates, 3 repeat checks, no max lazy / nice limits (-12.4 % vs -10.9 %, ~+7 % time), Heavy 24
+    ///               candidates, 2 lazy steps (-13.3 % vs -12.6 %, ~+10 % time).
+    /// Measured and rejected : MinMatch 5 above 256 KB (-1 to -5 % worse on JSON / CSV / text), a 5-byte single-entry side
+    /// table next to 6-byte chains (half the MinMatch 5 gain), double fast 4-byte short matches (+2.8 % size),
+    /// compressing small inputs twice (MinMatch 4-5 and 6, keep the smaller) : -0.6 % for twice the time.
+    /// </summary>
+    local procedure ApplyGeneralProfile(Level: Enum "TOO ZSTD Level")
+    begin
+        if InLen <= 262144 then begin
+            MaxStage := 6; // no LDM
+            DoubleFast := false;
+            RepCheckCount := 3;
+            if InLen <= 65536 then
+                MinMatch := 4
+            else
+                MinMatch := 5;
+            case Level of
+                Level::Fast:
+                    begin
+                        SearchDepth := 8; // speed mode limits of Fast kept (max insert 32, max lazy 32, nice 128)
+                        SkipRunInsert := true;
+                    end;
+                Level::Medium:
+                    begin
+                        SpeedMode := false;
+                        SearchDepth := 32;
+                        MaxInsertLen := 128;
+                        MaxLazyLen := 0;
+                        NiceLen := 0;
+                    end;
+                Level::Heavy:
+                    begin
+                        SearchDepth := 128;
+                        LazyDepth := 2;
+                    end;
+            end;
+            exit;
+        end;
+        case Level of
+            Level::Fast:
+                DfShortMul := 0; // 4-byte short hash
+            Level::Medium:
+                begin
+                    SearchDepth := 16;
+                    RepCheckCount := 3;
+                    MaxLazyLen := 0;
+                    NiceLen := 0;
+                end;
+            Level::Heavy:
+                begin
+                    SearchDepth := 24;
+                    LazyDepth := 2;
+                end;
+        end;
     end;
 
     /// <summary>SetTuning overrides (-1 = keep), consumed : one Compress call only.</summary>
@@ -1689,9 +1787,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
         Reach := WindowSize; // chain candidates : Q - Cand <= WindowSize and < 1M (Chain = position mod 1M)
         if Reach > 999999 then
             Reach := 999999;
-        RepChecks := 3;
-        if SpeedMode then
-            RepChecks := 1; // zstd lazy : only the last offset is tried
+        RepChecks := RepCheckCount; // ApplyLevel : speed mode 1 (zstd lazy : only the last offset is tried), else 3
         while Pos + 4 <= BlockEnd do begin
             if Lazy then
                 Q := Pos + 1
@@ -2009,9 +2105,10 @@ codeunit 51150 "TOO ZSTD Data Compression"
                 end;
             end;
             VPos := Pos;
-            // short hash on 5 bytes (VS + the low byte of VL, zstd dfast minMatch 5) : measured 2026-09-24 +1.2 % size, -7 % time
-            // (4-byte hash : a slot kept 4-byte-equal candidates that the 5-byte minimum then rejected). 4294967291 = prime < 2^32
-            HS := ((((VS + (VL mod 256) * 4294967296L) mod 4294967291L) * 506832829) mod 4294967296L) div 8192;
+            // short hash on 5 bytes (VS + the low byte of VL, zstd dfast minMatch 5) : measured 2026-09-24 on column exports
+            // +1.2 % size, -7 % time (4-byte hash : a slot kept 4-byte-equal candidates that the 5-byte minimum then rejected).
+            // General profile, large input : 4 bytes (DfShortMul = 0), -0.8 % size on general files. 4294967291 = prime < 2^32
+            HS := ((((VS + (VL mod 256) * DfShortMul) mod 4294967291L) * 506832829) mod 4294967296L) div 8192;
             // (a mod M + b mod M) mod M = (a mod M + b) mod M : b = VS x 2654435 < 2^54, sum < 2^55
             HL := (((VL * 1640531527) mod 4294967296L + VS * 2654435) mod 4294967296L) div 8192;
             CandL := DfLong[HL + 1] - 1 - PosBase;
@@ -2168,7 +2265,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
                             C := InText[P + J];
                             VL := VL * 256 + C;
                         end;
-                        HS := ((((VS + (VL mod 256) * 4294967296L) mod 4294967291L) * 506832829) mod 4294967296L) div 8192;
+                        HS := ((((VS + (VL mod 256) * DfShortMul) mod 4294967291L) * 506832829) mod 4294967296L) div 8192;
                         HL := (((VL * 1640531527) mod 4294967296L + VS * 2654435) mod 4294967296L) div 8192;
                         DfLong[HL + 1] := P + 1 + PosBase;
                         DfShort[HS + 1] := P + 1 + PosBase;
