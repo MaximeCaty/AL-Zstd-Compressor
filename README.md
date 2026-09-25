@@ -1,10 +1,10 @@
-# TOO ZSTD Data Compression
+# AL Zstandard Compression 
 
-Pure-AL zstd codec (RFC 8878), codeunit **51150**, enum **51150 "TOO ZSTD Level"**.
+Pure-AL zstd codec (RFC 8878)
 
-**Why:** in the cloud, AL only has `GZipCompress` (codeunit "Data Compression"), and custom DotNet and the file system are off-limits.
-This codec writes standard zstd frames, **5-15 % smaller than GZip** on column-store exports. The frames can be read by any zstd
-decoder: the `zstd` CLI, the on-prem .NET path, or this codeunit.
+**Why:** in the cloud, AL only has `GZipCompress` (codeunit "Data Compression").
+This codec writes standard zstd frames, **10-30 % smaller than GZip**. The frames can be read by any zstd
+decoder, including windows 11 builtin file explorer.
 
 ## Public API
 
