@@ -4,10 +4,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Optimize>true</Optimize>
+    <CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <NoWarn>CS0660;CS0661</NoWarn>
   </PropertyGroup>
-  <ItemGroup>
-    <None Include="brotli-dictionary.bin" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
 </Project>

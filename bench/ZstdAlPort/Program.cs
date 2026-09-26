@@ -15,6 +15,16 @@ if (args.Length > 1 && args[0] == "--tune")
         if (args[i] == "--set") { var kv = args[++i].Split('=', 2); sets.Add((kv[0], kv[1])); }
     return Tune.Run(args[1], sets);
 }
+if (args.Length > 1 && args[0] == "--brotli-al")
+    return BrotliAlBench.Run(args.Skip(1).ToArray());
+if (args.Length > 1 && args[0] == "--brotli")
+    return BrotliBench.Run(args.Skip(1).ToArray());
+if (args.Length > 1 && args[0] == "--bwtl")
+    return BwtLiteBench.Run(args.Skip(1).ToArray());
+if (args.Length > 1 && args[0] == "--bwtlite")
+    return BwtLite.Run(args.Skip(1).ToArray());
+if (args.Length > 1 && args[0] == "--bzip2")
+    return Bz2Bench.Run(args.Skip(1).ToArray());
 var paths = new List<string>();
 var levels = new List<ZstdLevel> { ZstdLevel.Fast, ZstdLevel.Medium, ZstdLevel.Heavy };
 var profiles = new List<ZstdProfile> { ZstdProfile.General };
