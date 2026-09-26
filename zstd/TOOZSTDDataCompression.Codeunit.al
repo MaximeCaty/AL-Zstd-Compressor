@@ -36,8 +36,9 @@
     - Compress match tables keep position + 1 + PosBase across calls : entries of earlier calls read as negative
       positions, so the ~3.6M table entries are only cleared when PosBase nears the Integer limit (exports compress many
       files).
-    - Compress appends one guard char to InText (InLen unchanged) : match loops compare past BlockEnd by one char
-      instead of testing a flag ; match extension = 16 per byte, 64-byte bulk, 256-byte bulk after a 64 hit, per byte.
+    - Compress appends 4 guard chars to InText (InLen unchanged) : match loops compare past BlockEnd by up to 4 chars
+      instead of testing a flag ; match extension = 16 by 4 bytes per test, 64-byte bulk, 256-byte bulk after a 64 hit,
+      4 bytes per test.
       Micro bench (codeunit "TOO ZSTD Micro Bench") : a statement / branch costs more than integer math, Substring
       compare 16 B 76 ns, 64 B 149 ns, 256 B 194 ns ; global and local scalars cost the same.
 */
@@ -109,9 +110,9 @@ codeunit 51150 "TOO ZSTD Data Compression"
         HufWeight: array[256] of Integer;
         HufMax: Integer;
         LeafSym: array[256] of Integer;
-        NodeW: array[512] of Integer;
         NodeParent: array[512] of Integer;
-        NodeAlive: array[512] of Boolean;
+        NodeDepth: array[512] of Integer;
+        HeapK: array[256] of Integer; // BuildHuffmanLengths min-heap : weight x 1024 + node
         PairTbl: array[65536] of Text[2]; // [Lo + Hi * 256 + 1] = 2 bytes, low first : one Append per 2 bitstream bytes
         MaxStage: Integer;
         WindowLog: Integer;
@@ -122,8 +123,8 @@ codeunit 51150 "TOO ZSTD Data Compression"
         Chain: array[1000000] of Integer; // position mod 1M -> previous position + 1 with the same hash
         NextIns: Integer; // next position to insert in the chains
         PosBase: Integer; // match tables store position + 1 + PosBase (see header)
-        InsV: BigInteger; // 4 bytes at InsVPos (rolling, stage 9)
-        InsVPos: Integer;
+        InsV: BigInteger; // rolling MinMatch-byte value of NextIns (SetNextIns)
+        InsLast: Integer; // last position inserted in the chains : InLen - MinMatch
         SeqAnchor: Integer; // first position not yet covered by a sequence
         FBLen: Integer;
         FBOff: Integer;
@@ -253,8 +254,8 @@ codeunit 51150 "TOO ZSTD Data Compression"
         InitLatin1();
         ReadInput(Source);
         ApplyLevel(Level, Profile); // after ReadInput : the General profile depends on InLen
-        // guard char past the input (InLen unchanged) : match loops read one char past BlockEnd without a bound test
-        InText += CharTbl[1];
+        // 4 guard chars past the input (InLen unchanged) : match loops read up to 4 chars past BlockEnd without a bound test
+        InText += CharTbl[1] + CharTbl[1] + CharTbl[1] + CharTbl[1];
         // match tables : stale entries of earlier calls are negative after the PosBase shift ; clear only near overflow
         if PosBase > 2000000000 - InLen then begin
             Clear(Head);
@@ -271,8 +272,8 @@ codeunit 51150 "TOO ZSTD Data Compression"
         if (MaxStage >= 7) and (InLen > LdmMinInput) then
             Clear(LdmNext);
         Clear(OutTB);
-        NextIns := 0;
-        InsVPos := -1;
+        InsLast := InLen - MinMatch;
+        SetNextIns(0);
         Rep1 := 1;
         Rep2 := 4;
         Rep3 := 8;
@@ -1755,16 +1756,15 @@ codeunit 51150 "TOO ZSTD Data Compression"
     /// -> previous position + 1 : AL arrays cap at 1M elements, so chains reach 1M bytes back), cheap reject on the byte
     /// just past the best length, gain = 4 x length - log2(offset value). A lazy step wins when its gain beats the current
     /// one + 4 (+ 7 at depth 2), zstd ZSTD_compressBlock_lazy_generic margins. The sequence record (EmitSequence) is inline.
+    /// Each AL statement costs a runtime hook (StmtHit) : a literal position runs ~20 statements + 4 per chain candidate.
     /// </summary>
     local procedure ParseLazy(Pos: Integer; BlockEnd: Integer)
     var
-        C: Integer;
         Q: Integer;
         Cand: Integer;
-        MaxLen: Integer;
+        I: Integer;
         L: Integer;
         G: Integer;
-        B: Integer;
         R: Integer;
         RepNo: Integer;
         SDepth: Integer;
@@ -1775,93 +1775,145 @@ codeunit 51150 "TOO ZSTD Data Compression"
         LL: Integer;
         OV: Integer;
         RepCode: Integer;
-        RepChecks: Integer;
         Lim: Integer;
-        MinCand: Integer;
+        LimQ: Integer;
         Reach: Integer;
-        Last: Integer;
+        LazyInc: Integer;
+        RunDiv: Integer;
+        NiceStop: Integer;
+        LazyStop: Integer;
+        DepthOf: array[2] of Integer;
         QChar: Char;
-        Lazy: Boolean;
         Emit: Boolean;
     begin
         Reach := WindowSize; // chain candidates : Q - Cand <= WindowSize and < 1M (Chain = position mod 1M)
         if Reach > 999999 then
             Reach := 999999;
-        RepChecks := RepCheckCount; // ApplyLevel : speed mode 1 (zstd lazy : only the last offset is tried), else 3
-        while Pos + 4 <= BlockEnd do begin
-            if Lazy then
-                Q := Pos + 1
-            else
-                Q := Pos;
-
-            // chain insertion up to Q (rolling MinMatch-byte value : one char read per position). Tight loop : 1 branch per
-            // position (branches cost more than math in AL). Positions past InLen - MinMatch are never inserted ; the roll
-            // reads at most one char past InLen : guard char (the stale InsV it leaves is never used).
-            if NextIns <= Q then begin
-                Last := Q;
-                if Last > InLen - MinMatch then
-                    Last := InLen - MinMatch;
-                if NextIns <= Last then begin
-                    if InsVPos <> NextIns then begin
-                        InsV := 0;
-                        for L := MinMatch downto 1 do begin
-                            C := InText[NextIns + L];
-                            InsV := InsV * 256 + C;
-                        end;
-                    end;
-                    // hash = InsV mod (2^19 - 1, prime) : all bytes contribute. Each AL statement costs a runtime hook
-                    // (StmtHit) : the hash is computed twice and the char folded into the roll, 4 statements per position
-                    repeat
-                        Chain[NextIns mod 1000000 + 1] := Head[InsV mod 524287 + 1];
-                        Head[InsV mod 524287 + 1] := NextIns + 1 + PosBase;
-                        InsV := InsV div 256 + InText[NextIns + MinMatch + 1] * HashMul;
-                        NextIns += 1;
-                    until NextIns > Last;
-                    InsVPos := NextIns;
-                end;
-                NextIns := Q + 1;
+        // limits set to 0 (off) become a length no match reaches : one test per use
+        NiceStop := NiceLen;
+        if NiceStop <= 0 then
+            NiceStop := 2147483647;
+        LazyStop := MaxLazyLen;
+        if LazyStop <= 0 then
+            LazyStop := 2147483647;
+        // literal step 1 + run / 128 in speed mode (zstd kSearchStrength 7), else 1
+        RunDiv := 1073741824;
+        if SpeedMode then
+            RunDiv := 128;
+        // chain depth DepthOf[LazyInc + 1] : primary search, lazy step (set with the match to beat)
+        DepthOf[1] := SearchDepth;
+        DepthOf[2] := SearchDepth;
+        // per-byte extension limit min(16, BlockEnd - Q) : Q only increases, so it drops below 16 only past LimQ
+        Lim := 16;
+        LimQ := BlockEnd - 16;
+        // position 0 of the input is a literal (no repeat offset or chain entry before it) : inserted only, searches start
+        // at 1. So PRep1 <= Q at every search : an offset never passes its match start, the initial PRep1 is 1
+        if Pos = 0 then begin
+            if (NextIns = 0) and (InsLast >= 0) and (BlockEnd >= 4) then begin
+                Chain[1] := Head[InsV mod 524287 + 1];
+                Head[InsV mod 524287 + 1] := 1 + PosBase;
+                InsV := InsV div 256 + InText[MinMatch + 1] * HashMul;
+                NextIns := 1;
             end;
+            Pos := 1;
+        end;
+        // Q = search position : Pos + LazyInc (0 : primary search, 1 : lazy step). A literal moves Q only, Pos is set at a match
+        Q := Pos;
+        while Q - LazyInc + 4 <= BlockEnd do begin
+            // chain insertion up to Q (rolling MinMatch-byte value InsV of NextIns, kept by SetNextIns when NextIns jumps :
+            // one char read per position) : one position after a literal or for a lazy step, the match positions after a
+            // match. Positions past InsLast = InLen - MinMatch are never inserted ; the roll reads at most one char past
+            // InLen : guard chars (the stale InsV it leaves is never used)
+            if (NextIns <= Q) and (Q <= InsLast) then begin
+                if NextIns = Q then begin
+                    Chain[Q mod 1000000 + 1] := Head[InsV mod 524287 + 1];
+                    Head[InsV mod 524287 + 1] := Q + 1 + PosBase;
+                    InsV := InsV div 256 + InText[Q + MinMatch + 1] * HashMul;
+                end else
+                    for I := NextIns to Q do begin
+                        Chain[I mod 1000000 + 1] := Head[InsV mod 524287 + 1];
+                        Head[InsV mod 524287 + 1] := I + 1 + PosBase;
+                        InsV := InsV div 256 + InText[I + MinMatch + 1] * HashMul;
+                    end;
+                NextIns := Q + 1;
+            end else
+                if NextIns <= Q then begin
+                    for I := NextIns to InsLast do begin
+                        Chain[I mod 1000000 + 1] := Head[InsV mod 524287 + 1];
+                        Head[InsV mod 524287 + 1] := I + 1 + PosBase;
+                        InsV := InsV div 256 + InText[I + MinMatch + 1] * HashMul;
+                    end;
+                    NextIns := Q + 1;
+                end;
 
-            // best match at Q (FBOff is only read when FBLen > 0 and always set with it : no reset)
+            // best match at Q (FBOff is only read when FBLen > 0 and always set with it : no reset). BlockEnd - Q >= 4 : a
+            // primary Q has Pos + 4 <= BlockEnd, a lazy one Pos + 5 <= BlockEnd
             FBLen := 0;
             FBGain := 0;
-            MaxLen := BlockEnd - Q;
-            if MaxLen >= 4 then begin
-                Lim := MaxLen; // per-byte extension limit, repeat and chain candidates
-                if Lim > 16 then
-                    Lim := 16;
-                // repeat offsets : offset value 1..3, ~1 bit
-                for RepNo := 1 to RepChecks do begin
-                    case RepNo of
-                        1:
-                            R := PRep1;
-                        2:
-                            R := PRep2;
-                        3:
-                            R := PRep3;
-                    end;
-                    if (R <= Q) and (R <= WindowSize) then begin
-                        // extension ladder (same as the chain candidates) : repeat matches are the long ones in column data
+            if Q > LimQ then
+                Lim := BlockEnd - Q;
+            SDepth := DepthOf[LazyInc + 1];
+            // repeat offsets : offset value 1..3, ~1 bit. The first byte is tested before the extension (most fail there) ;
+            // PRep1 <= Q, PRep2 / PRep3 (RepCheckCount 3) can still be the initial 4 / 8. A match up to the block end or
+            // of NiceLen (gzip nice_length) ends the search (SDepth 0). HOT-INLINE : same code for the 3 offsets
+            if InText[Q - PRep1 + 1] = InText[Q + 1] then begin
+                Cand := Q - PRep1;
+                L := 1;
+                while (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < Lim) do // guard chars : no bound read
+                    L += 1;
+                if L = 16 then begin
+                    if Q + L + 64 <= BlockEnd then
+                        if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then begin
+                            L += 64;
+                            while Q + L + 256 <= BlockEnd do
+                                if InText.Substring(Cand + L + 1, 256) = InText.Substring(Q + L + 1, 256) then
+                                    L += 256
+                                else
+                                    break;
+                            while Q + L + 64 <= BlockEnd do
+                                if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then
+                                    L += 64
+                                else
+                                    break;
+                        end;
+                    while (InText[Cand + L + 1] = InText[Q + L + 1]) and (Q + L < BlockEnd) do
+                        L += 1;
+                end;
+                if L >= 4 then begin
+                    FBLen := L; // first candidate : gain 4 x L - 1 > 0
+                    FBOff := PRep1;
+                    FBGain := L * 4 - 1;
+                    if (Q + L = BlockEnd) or (L >= NiceStop) then
+                        SDepth := 0;
+                end;
+            end;
+            for RepNo := 2 to RepCheckCount do begin
+                if RepNo = 2 then
+                    R := PRep2
+                else
+                    R := PRep3;
+                if (R <= Q) and (R <= WindowSize) then
+                    if InText[Q - R + 1] = InText[Q + 1] then begin
                         Cand := Q - R;
-                        L := 0;
-                        while (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < Lim) do // guard char : no bound read
+                        L := 1;
+                        while (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < Lim) do
                             L += 1;
                         if L = 16 then begin
-                            if L + 64 <= MaxLen then
+                            if Q + L + 64 <= BlockEnd then
                                 if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then begin
                                     L += 64;
-                                    while L + 256 <= MaxLen do
+                                    while Q + L + 256 <= BlockEnd do
                                         if InText.Substring(Cand + L + 1, 256) = InText.Substring(Q + L + 1, 256) then
                                             L += 256
                                         else
                                             break;
-                                    while L + 64 <= MaxLen do
+                                    while Q + L + 64 <= BlockEnd do
                                         if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then
                                             L += 64
                                         else
                                             break;
                                 end;
-                            while (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < MaxLen) do
+                            while (InText[Cand + L + 1] = InText[Q + L + 1]) and (Q + L < BlockEnd) do
                                 L += 1;
                         end;
                         if L >= 4 then begin
@@ -1870,189 +1922,215 @@ codeunit 51150 "TOO ZSTD Data Compression"
                                 FBLen := L;
                                 FBOff := R;
                                 FBGain := G;
+                                if (Q + L = BlockEnd) or (L >= NiceStop) then
+                                    SDepth := 0;
                             end;
                         end;
                     end;
-                end;
+            end;
 
-                // hash chain (the head entry for Q is Q itself ; a Q past InLen - MinMatch was not inserted : its slot holds
-                // an older or previous-call entry, rejected by MinCand) ; NiceLen : gzip nice_length (a repeat match that
-                // long ends the search) ; speed mode good_length 8 (the lazy step only has to beat a decent match : depth / 4)
-                if (FBLen < MaxLen) and not ((NiceLen > 0) and (FBLen >= NiceLen)) then begin
-                    Cand := Chain[Q mod 1000000 + 1] - 1 - PosBase;
-                    SDepth := SearchDepth;
-                    if SpeedMode and Lazy and (BestLen >= 8) then
-                        SDepth := (SearchDepth + 3) div 4;
-                    // one bound test per candidate : Cand >= 0, Q - Cand <= WindowSize, Q - Cand < 1M (chain reach)
-                    MinCand := Q - Reach;
-                    if MinCand < 0 then
-                        MinCand := 0;
-                    QChar := InText[Q + FBLen + 1]; // cheap reject char, Q side : changes only with FBLen
-                    while (Cand >= MinCand) and (SDepth > 0) do begin
-                        if InText[Cand + FBLen + 1] = QChar then begin
-                            // a candidate beats the best only if it is longer : later chain candidates are farther (same
-                            // or larger log2 offset), repeat gains are 4 x L - 1. So once FBLen >= 16, its FBLen bytes are
-                            // checked in one bulk compare (byte FBLen already matched the reject char), L = -1 : cannot win
-                            L := 0;
-                            if FBLen >= 16 then
-                                if InText.Substring(Cand + 1, FBLen) = InText.Substring(Q + 1, FBLen) then
-                                    L := FBLen + 1
-                                else
-                                    L := -1;
-                            if L >= 0 then begin
-                                // extension : per byte up to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then per byte
-                                while (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < Lim) do // guard char : no bound read
-                                    L += 1;
-                                if L >= 16 then begin
-                                    if L + 64 <= MaxLen then
-                                        if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then begin
-                                            L += 64;
-                                            while L + 256 <= MaxLen do
-                                                if InText.Substring(Cand + L + 1, 256) = InText.Substring(Q + L + 1, 256) then
-                                                    L += 256
-                                                else
-                                                    break;
-                                            while L + 64 <= MaxLen do
-                                                if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then
-                                                    L += 64
-                                                else
-                                                    break;
-                                        end;
-                                    while (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < MaxLen) do
-                                        L += 1;
+            // hash chain (the head entry for Q is Q itself ; a Q past InsLast was not inserted : its slot holds an older or
+            // previous-call entry, rejected by the reach test) ; speed mode good_length 8 : a lazy step after a match >= 8
+            // searches depth / 4 (DepthOf[2])
+            Cand := Chain[Q mod 1000000 + 1] - 1 - PosBase;
+            QChar := InText[Q + FBLen + 1]; // cheap reject char, Q side : changes only with FBLen (<= BlockEnd + 1 : guard char)
+            // bounds in the loop test : Cand >= 0 (an entry of this call), Q - Cand <= Reach (window, chain reach)
+            while (Q - Cand <= Reach) and (Cand >= 0) and (SDepth > 0) do begin
+                if InText[Cand + FBLen + 1] = QChar then begin
+                    // a candidate beats the best only if it is longer : later chain candidates are farther (same
+                    // or larger log2 offset), repeat gains are 4 x L - 1. So once FBLen >= 16, its FBLen bytes are
+                    // checked in one bulk compare (byte FBLen already matched the reject char), L = -1 : cannot win
+                    L := 0;
+                    if FBLen >= 16 then
+                        if InText.Substring(Cand + 1, FBLen) = InText.Substring(Q + 1, FBLen) then
+                            L := FBLen + 1
+                        else
+                            L := -1;
+                    if L >= 0 then begin
+                        // extension : 4 bytes per test up to Lim (16), 64-byte bulk, 256-byte bulk after a 64 hit, then 4
+                        // bytes per test. The tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
+                        while (InText[Cand + L + 1] = InText[Q + L + 1]) and (InText[Cand + L + 2] = InText[Q + L + 2]) and
+                            (InText[Cand + L + 3] = InText[Q + L + 3]) and (InText[Cand + L + 4] = InText[Q + L + 4]) and (L + 4 <= Lim)
+                        do
+                            L += 4;
+                        if (InText[Cand + L + 1] = InText[Q + L + 1]) and (InText[Cand + L + 2] = InText[Q + L + 2]) and (L + 2 <= Lim) then
+                            L += 2;
+                        if (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < Lim) then
+                            L += 1;
+                        if L >= 16 then begin
+                            if Q + L + 64 <= BlockEnd then
+                                if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then begin
+                                    L += 64;
+                                    while Q + L + 256 <= BlockEnd do
+                                        if InText.Substring(Cand + L + 1, 256) = InText.Substring(Q + L + 1, 256) then
+                                            L += 256
+                                        else
+                                            break;
+                                    while Q + L + 64 <= BlockEnd do
+                                        if InText.Substring(Cand + L + 1, 64) = InText.Substring(Q + L + 1, 64) then
+                                            L += 64
+                                        else
+                                            break;
                                 end;
-                            end;
-                            if L >= MinMatch then begin
-                                // G = 4 x L - highbit(offset + 3), highbit by table (no halving loop)
-                                B := Q - Cand + 3;
-                                if B <= 1024 then
-                                    G := L * 4 - HBTbl[B]
-                                else
-                                    if B <= 1048576 then
-                                        G := L * 4 - 10 - HBTbl[B div 1024]
-                                    else
-                                        G := L * 4 - 20 - HBTbl[B div 1048576];
-                                if G > FBGain then begin
-                                    FBLen := L;
-                                    FBOff := Q - Cand;
-                                    FBGain := G;
-                                    QChar := InText[Q + FBLen + 1]; // <= BlockEnd + 1 : guard char
-                                    if (L = MaxLen) or ((NiceLen > 0) and (L >= NiceLen)) then
-                                        SDepth := 0;
-                                end;
-                            end;
+                            while (InText[Cand + L + 1] = InText[Q + L + 1]) and (InText[Cand + L + 2] = InText[Q + L + 2]) and
+                                (InText[Cand + L + 3] = InText[Q + L + 3]) and (InText[Cand + L + 4] = InText[Q + L + 4]) and (Q + L + 4 <= BlockEnd)
+                            do
+                                L += 4;
+                            if (InText[Cand + L + 1] = InText[Q + L + 1]) and (InText[Cand + L + 2] = InText[Q + L + 2]) and (Q + L + 2 <= BlockEnd) then
+                                L += 2;
+                            if (InText[Cand + L + 1] = InText[Q + L + 1]) and (Q + L < BlockEnd) then
+                                L += 1;
                         end;
-                        // no SDepth > 0 test : a stop (SDepth := 0) turns into -1 here and ends the loop, Cand is unused after
-                        Cand := Chain[Cand mod 1000000 + 1] - 1 - PosBase;
-                        SDepth -= 1;
+                    end;
+                    if L >= MinMatch then begin
+                        // G = 4 x L - highbit(offset + 3), highbit by table (no halving loop) ; offset + 3 <= Reach + 3 < 2^20
+                        if Q - Cand > 1021 then
+                            G := L * 4 - 10 - HBTbl[(Q - Cand + 3) div 1024]
+                        else
+                            G := L * 4 - HBTbl[Q - Cand + 3];
+                        if G > FBGain then begin
+                            FBLen := L;
+                            FBOff := Q - Cand;
+                            FBGain := G;
+                            QChar := InText[Q + FBLen + 1]; // <= BlockEnd + 1 : guard char
+                            if (Q + L = BlockEnd) or (L >= NiceStop) then
+                                SDepth := 0;
+                        end;
                     end;
                 end;
+                // no SDepth > 0 test : a stop (SDepth := 0) turns into -1 here and ends the loop, Cand is unused after
+                Cand := Chain[Cand mod 1000000 + 1] - 1 - PosBase;
+                SDepth -= 1;
             end;
 
             // primary / lazy decision
-            Emit := false;
-            if not Lazy then begin
-                if FBLen = 0 then begin
-                    if SpeedMode then begin
-                        Pos += 1 + (Pos - SeqAnchor) div 128; // zstd kSearchStrength 7 : longer literal run, bigger step (8 : +0.08 % size, +1.6 % time)
-                        if SkipRunInsert then
-                            if NextIns < Pos then
-                                NextIns := Pos; // skipped positions are not indexed (step 1 : NextIns = Pos already)
-                    end else
-                        Pos += 1;
-                end else begin
+            if FBLen + LazyInc = 0 then begin
+                // primary search, no match : literal (step 1, or 1 + run / 128 in speed mode ; kSearchStrength 8 : +0.08 %
+                // size, +1.6 % time)
+                Q += 1 + (Q - SeqAnchor) div RunDiv;
+                if (NextIns < Q) and SkipRunInsert then
+                    SetNextIns(Q); // skipped positions are not indexed (step 1 : NextIns = Q already)
+            end else begin
+                Pos := Q - LazyInc;
+                Emit := true;
+                if LazyInc = 0 then begin
                     BestLen := FBLen;
                     BestOff := FBOff;
                     BestGain := FBGain;
                     Depth := 1;
                     // MaxLazyLen : gzip max_lazy, no lazy step after a long match
-                    if (LazyDepth >= 1) and (Pos + 5 <= BlockEnd) and not ((MaxLazyLen > 0) and (BestLen >= MaxLazyLen)) then
-                        Lazy := true
-                    else
-                        Emit := true;
-                end;
-            end else
-                if FBGain > BestGain + 1 + 3 * Depth then begin
-                    Pos += 1;
-                    BestLen := FBLen;
-                    BestOff := FBOff;
-                    BestGain := FBGain;
-                    Depth += 1;
-                    if (Depth > LazyDepth) or (Pos + 5 > BlockEnd) or ((MaxLazyLen > 0) and (BestLen >= MaxLazyLen)) then
-                        Emit := true;
+                    if (LazyDepth >= 1) and (Pos + 5 <= BlockEnd) and (BestLen < LazyStop) then begin
+                        LazyInc := 1;
+                        Emit := false;
+                    end;
                 end else
-                    Emit := true;
+                    if FBGain > BestGain + 1 + 3 * Depth then begin
+                        Pos += 1;
+                        BestLen := FBLen;
+                        BestOff := FBOff;
+                        BestGain := FBGain;
+                        Depth += 1;
+                        if (Depth <= LazyDepth) and (Pos + 5 <= BlockEnd) and (BestLen < LazyStop) then
+                            Emit := false;
+                    end;
 
-            if Emit then begin
-                // HOT-INLINE copy of EmitSequence(Pos, BestLen, BestOff)
-                LL := Pos - SeqAnchor;
-                if LL > 0 then begin
-                    LitTB.Append(InText.Substring(SeqAnchor + 1, LL));
-                    LitCount += LL;
-                end;
-                OV := BestOff + 3;
-                if MaxStage >= 5 then
+                if Emit then begin
+                    // HOT-INLINE copy of EmitSequence(Pos, BestLen, BestOff)
+                    LL := Pos - SeqAnchor;
                     if LL > 0 then begin
-                        if BestOff = PRep1 then
-                            OV := 1
-                        else
+                        LitTB.Append(InText.Substring(SeqAnchor + 1, LL));
+                        LitCount += LL;
+                    end;
+                    OV := BestOff + 3;
+                    if MaxStage >= 5 then
+                        if LL > 0 then begin
+                            if BestOff = PRep1 then
+                                OV := 1
+                            else
+                                if BestOff = PRep2 then
+                                    OV := 2
+                                else
+                                    if BestOff = PRep3 then
+                                        OV := 3;
+                        end else
                             if BestOff = PRep2 then
-                                OV := 2
+                                OV := 1
                             else
                                 if BestOff = PRep3 then
-                                    OV := 3;
-                    end else
-                        if BestOff = PRep2 then
-                            OV := 1
-                        else
-                            if BestOff = PRep3 then
-                                OV := 2
-                            else
-                                if BestOff = PRep1 - 1 then
-                                    OV := 3;
-                if OV > 3 then begin
-                    PRep3 := PRep2;
-                    PRep2 := PRep1;
-                    PRep1 := BestOff;
-                end else begin
-                    RepCode := OV;
-                    if LL = 0 then
-                        RepCode += 1;
-                    case RepCode of
-                        2:
-                            begin
-                                PRep2 := PRep1;
-                                PRep1 := BestOff;
-                            end;
-                        3, 4:
-                            begin
-                                PRep3 := PRep2;
-                                PRep2 := PRep1;
-                                PRep1 := BestOff;
-                            end;
+                                    OV := 2
+                                else
+                                    if BestOff = PRep1 - 1 then
+                                        OV := 3;
+                    if OV > 3 then begin
+                        PRep3 := PRep2;
+                        PRep2 := PRep1;
+                        PRep1 := BestOff;
+                    end else begin
+                        RepCode := OV;
+                        if LL = 0 then
+                            RepCode += 1;
+                        case RepCode of
+                            2:
+                                begin
+                                    PRep2 := PRep1;
+                                    PRep1 := BestOff;
+                                end;
+                            3, 4:
+                                begin
+                                    PRep3 := PRep2;
+                                    PRep2 := PRep1;
+                                    PRep1 := BestOff;
+                                end;
+                        end;
                     end;
+                    NbSeq += 1;
+                    SeqLL[NbSeq] := LL;
+                    SeqML[NbSeq] := BestLen;
+                    SeqOfv[NbSeq] := OV;
+                    SeqAnchor := Pos + BestLen;
+                    Pos += BestLen;
+                    LazyInc := 0;
+                    Q := Pos;
+                    // gzip max_insert_length : a match > MaxInsertLen only indexes its last MaxInsertLen / 4 positions (32 : 8)
+                    if (MaxInsertLen > 0) and (BestLen > MaxInsertLen) and (NextIns < Pos - MaxInsertLen div 4) then
+                        SetNextIns(Pos - MaxInsertLen div 4);
+                end else begin
+                    // lazy step at Pos + 1 ; speed mode good_length 8 : depth / 4 after a match >= 8
+                    Q := Pos + 1;
+                    if SpeedMode and (BestLen >= 8) then
+                        DepthOf[2] := (SearchDepth + 3) div 4
+                    else
+                        DepthOf[2] := SearchDepth;
                 end;
-                NbSeq += 1;
-                SeqLL[NbSeq] := LL;
-                SeqML[NbSeq] := BestLen;
-                SeqOfv[NbSeq] := OV;
-                SeqAnchor := Pos + BestLen;
-                Pos += BestLen;
-                Lazy := false;
-                // gzip max_insert_length : a match > MaxInsertLen only indexes its last MaxInsertLen / 4 positions (32 : 8)
-                if (MaxInsertLen > 0) and (BestLen > MaxInsertLen) and (NextIns < Pos - MaxInsertLen div 4) then
-                    NextIns := Pos - MaxInsertLen div 4;
             end;
         end;
+    end;
+
+    /// <summary>
+    /// Chain insertion jumps to position P (NextIns := P, NextIns only grows) : rolling MinMatch-byte value InsV of P, byte P
+    /// lowest. ParseLazy only rolls it, so every jump goes through here.
+    /// </summary>
+    local procedure SetNextIns(P: Integer)
+    var
+        L: Integer;
+    begin
+        NextIns := P;
+        if P > InsLast then
+            exit;
+        InsV := 0;
+        for L := MinMatch downto 1 do
+            InsV := InsV * 256 + InText[P + L];
     end;
 
     /// <summary>
     /// Stage 9 double fast parse (zstd ZSTD_compressBlock_doubleFast, simplified) : no chains, 2 single-entry tables
     /// (DfLong : 8-byte hash, DfShort : 5-byte hash, 19 bits each), filled only where a search happens + 2 positions
     /// per match. Candidates in order : Rep1 at Pos + 1 (LL >= 1, costs ~1 bit), the 8-byte one (>= 8 equal),
-    /// the 5-byte one (>= 5 equal) ; the match is extended forward (per byte to 16, 64-byte bulk, per byte) and backward
-    /// into the pending literals. No match : skip 1 + (literal run) / 128 (zstd kSearchStrength 7 ; 8 : -0.03 % size, +1.2 % time).
-    /// The sequence record (EmitSequence) is inline.
+    /// the 5-byte one (>= 5 equal) ; the first one that reaches its minimum wins. A candidate is extended only when its
+    /// first byte matches : forward (4 bytes per test to 16, 64-byte bulk, 4 bytes per test), then backward into the
+    /// pending literals. No match : skip 1 + (literal run) / 128 (zstd kSearchStrength 7 ; 8 : -0.03 % size, +1.2 % time).
+    /// The sequence record (EmitSequence) is inline. HOT-INLINE : one copy of the extension per
+    /// candidate (a loop over the 3 kinds cost ~20 statements per position).
     /// </summary>
     local procedure ParseDoubleFast(Pos: Integer; BlockEnd: Integer)
     var
@@ -2060,17 +2138,11 @@ codeunit 51150 "TOO ZSTD Data Compression"
         VL: BigInteger;
         HS: Integer;
         HL: Integer;
-        C: Integer;
-        K: Integer;
-        J: Integer;
         P: Integer;
-        Kind: Integer;
         CandL: Integer;
         CandS: Integer;
         Cn: Integer;
         S: Integer;
-        MinL: Integer;
-        MaxLen: Integer;
         L: Integer;
         ML: Integer;
         MStart: Integer;
@@ -2080,8 +2152,6 @@ codeunit 51150 "TOO ZSTD Data Compression"
         OV: Integer;
         RepCode: Integer;
         VPos: Integer;
-        Lim: Integer;
-        Valid: Boolean;
         Same: Boolean;
     begin
         VPos := -2;
@@ -2089,20 +2159,11 @@ codeunit 51150 "TOO ZSTD Data Compression"
             // 4 and 8 bytes at Pos (little-endian : VS low byte = InText[Pos + 1], VL = the next 4)
             if VPos = Pos - 1 then begin
                 // rolled from Pos - 1 : one char read instead of 8
-                C := InText[Pos + 8];
                 VS := VS div 256 + (VL mod 256) * 16777216L;
-                VL := VL div 256 + C * 16777216L;
+                VL := VL div 256 + InText[Pos + 8] * 16777216L;
             end else begin
-                VS := 0;
-                for K := 4 downto 1 do begin
-                    C := InText[Pos + K];
-                    VS := VS * 256 + C;
-                end;
-                VL := 0;
-                for K := 8 downto 5 do begin
-                    C := InText[Pos + K];
-                    VL := VL * 256 + C;
-                end;
+                VS := InText[Pos + 1] + InText[Pos + 2] * 256 + InText[Pos + 3] * 65536 + InText[Pos + 4] * 16777216L;
+                VL := InText[Pos + 5] + InText[Pos + 6] * 256 + InText[Pos + 7] * 65536 + InText[Pos + 8] * 16777216L;
             end;
             VPos := Pos;
             // short hash on 5 bytes (VS + the low byte of VL, zstd dfast minMatch 5) : measured 2026-09-24 on column exports
@@ -2116,71 +2177,147 @@ codeunit 51150 "TOO ZSTD Data Compression"
             DfLong[HL + 1] := Pos + 1 + PosBase;
             DfShort[HS + 1] := Pos + 1 + PosBase;
 
+            // Rep1 at Pos + 1 (minimum 4)
             ML := 0;
-            for Kind := 1 to 3 do
-                if ML = 0 then begin
-                    Valid := false;
-                    case Kind of
-                        1:
-                            begin
-                                S := Pos + 1;
-                                Cn := S - PRep1;
-                                MinL := 4;
-                                Valid := Cn >= 0;
+            S := Pos + 1;
+            Cn := S - PRep1;
+            if Cn >= 0 then
+                if InText[Cn + 1] = InText[S + 1] then begin
+                    L := 1;
+                    // extension : 4 bytes per test to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then 4 bytes per test. The
+                    // tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
+                    while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
+                        (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (L + 4 <= 16) and (S + L + 4 <= BlockEnd)
+                    do
+                        L += 4;
+                    if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (L + 2 <= 16) and (S + L + 2 <= BlockEnd) then
+                        L += 2;
+                    if (InText[Cn + L + 1] = InText[S + L + 1]) and (L < 16) and (S + L < BlockEnd) then
+                        L += 1;
+                    if L = 16 then begin
+                        if S + L + 64 <= BlockEnd then
+                            if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then begin
+                                L += 64;
+                                while S + L + 256 <= BlockEnd do
+                                    if InText.Substring(Cn + L + 1, 256) = InText.Substring(S + L + 1, 256) then
+                                        L += 256
+                                    else
+                                        break;
+                                while S + L + 64 <= BlockEnd do
+                                    if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then
+                                        L += 64
+                                    else
+                                        break;
                             end;
-                        2:
-                            begin
-                                S := Pos;
-                                Cn := CandL;
-                                MinL := 8;
-                                if Cn >= 0 then
-                                    Valid := Pos - Cn <= WindowSize;
-                            end;
-                        3:
-                            begin
-                                S := Pos;
-                                Cn := CandS;
-                                MinL := 5; // zstd level 3 minMatch : a 4-byte match barely pays for its sequence
-                                if (Cn >= 0) and (Cn <> CandL) then
-                                    Valid := Pos - Cn <= WindowSize;
-                            end;
+                        while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
+                            (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
+                        do
+                            L += 4;
+                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
+                            L += 2;
+                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
+                            L += 1;
                     end;
-                    if Valid then begin
-                        // extension : per byte to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then per byte. Measured :
-                        // candidates mostly stop after a few bytes, where per-char wins ; a 64 + binary-refine Substring
-                        // scheme cost 5.5 -> 8.9 s. Byte loops read one char past BlockEnd at most : guard char.
-                        MaxLen := BlockEnd - S;
-                        Lim := MaxLen;
-                        if Lim > 16 then
-                            Lim := 16;
-                        L := 0;
-                        while (InText[Cn + L + 1] = InText[S + L + 1]) and (L < Lim) do
+                    if L >= 4 then begin
+                        ML := L;
+                        MStart := S;
+                        Off := PRep1;
+                    end;
+                end;
+            // the 8-byte candidate (minimum 8), then the 5-byte one (minimum 5 : zstd level 3 minMatch, a 4-byte match barely
+            // pays for its sequence)
+            if ML = 0 then begin
+                S := Pos;
+                if (CandL >= 0) and (Pos - CandL <= WindowSize) then
+                    if InText[CandL + 1] = InText[Pos + 1] then begin
+                        Cn := CandL;
+                        L := 1;
+                        // extension : 4 bytes per test to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then 4 bytes per test. The
+                        // tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
+                        while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
+                            (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (L + 4 <= 16) and (S + L + 4 <= BlockEnd)
+                        do
+                            L += 4;
+                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (L + 2 <= 16) and (S + L + 2 <= BlockEnd) then
+                            L += 2;
+                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (L < 16) and (S + L < BlockEnd) then
                             L += 1;
                         if L = 16 then begin
-                            if L + 64 <= MaxLen then
+                            if S + L + 64 <= BlockEnd then
                                 if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then begin
                                     L += 64;
-                                    while L + 256 <= MaxLen do
+                                    while S + L + 256 <= BlockEnd do
                                         if InText.Substring(Cn + L + 1, 256) = InText.Substring(S + L + 1, 256) then
                                             L += 256
                                         else
                                             break;
-                                    while L + 64 <= MaxLen do
+                                    while S + L + 64 <= BlockEnd do
                                         if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then
                                             L += 64
                                         else
                                             break;
                                 end;
-                            while (InText[Cn + L + 1] = InText[S + L + 1]) and (L < MaxLen) do
+                            while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
+                                (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
+                            do
+                                L += 4;
+                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
+                                L += 2;
+                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
                                 L += 1;
                         end;
-                        if L >= MinL then begin
+                        if L >= 8 then begin
                             ML := L;
-                            MStart := S;
-                            Off := S - Cn;
+                            MStart := Pos;
+                            Off := Pos - CandL;
                         end;
                     end;
-                end;
+                if ML = 0 then
+                    if (CandS >= 0) and (CandS <> CandL) and (Pos - CandS <= WindowSize) then
+                        if InText[CandS + 1] = InText[Pos + 1] then begin
+                            Cn := CandS;
+                            L := 1;
+                            // extension : 4 bytes per test to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then 4 bytes per test. The
+                            // tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
+                            while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
+                                (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (L + 4 <= 16) and (S + L + 4 <= BlockEnd)
+                            do
+                                L += 4;
+                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (L + 2 <= 16) and (S + L + 2 <= BlockEnd) then
+                                L += 2;
+                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (L < 16) and (S + L < BlockEnd) then
+                                L += 1;
+                            if L = 16 then begin
+                                if S + L + 64 <= BlockEnd then
+                                    if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then begin
+                                        L += 64;
+                                        while S + L + 256 <= BlockEnd do
+                                            if InText.Substring(Cn + L + 1, 256) = InText.Substring(S + L + 1, 256) then
+                                                L += 256
+                                            else
+                                                break;
+                                        while S + L + 64 <= BlockEnd do
+                                            if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then
+                                                L += 64
+                                            else
+                                                break;
+                                    end;
+                                while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
+                                    (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
+                                do
+                                    L += 4;
+                                if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
+                                    L += 2;
+                                if (InText[Cn + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
+                                    L += 1;
+                            end;
+                            if L >= 5 then begin
+                                ML := L;
+                                MStart := Pos;
+                                Off := Pos - CandS;
+                            end;
+                        end;
+            end;
 
             if ML = 0 then
                 Pos += 1 + (Pos - SeqAnchor) div 128
@@ -2249,27 +2386,23 @@ codeunit 51150 "TOO ZSTD Data Compression"
                 SeqAnchor := NewPos;
 
                 // index 2 positions of the match : start + 2, end - 2
-                for K := 1 to 2 do begin
-                    if K = 1 then
-                        P := MStart + 2
-                    else
-                        P := NewPos - 2;
-                    if (P > Pos) and (P + 8 <= InLen) then begin
-                        VS := 0;
-                        for J := 4 downto 1 do begin
-                            C := InText[P + J];
-                            VS := VS * 256 + C;
-                        end;
-                        VL := 0;
-                        for J := 8 downto 5 do begin
-                            C := InText[P + J];
-                            VL := VL * 256 + C;
-                        end;
-                        HS := ((((VS + (VL mod 256) * DfShortMul) mod 4294967291L) * 506832829) mod 4294967296L) div 8192;
-                        HL := (((VL * 1640531527) mod 4294967296L + VS * 2654435) mod 4294967296L) div 8192;
-                        DfLong[HL + 1] := P + 1 + PosBase;
-                        DfShort[HS + 1] := P + 1 + PosBase;
-                    end;
+                P := MStart + 2;
+                if (P > Pos) and (P + 8 <= InLen) then begin
+                    VS := InText[P + 1] + InText[P + 2] * 256 + InText[P + 3] * 65536 + InText[P + 4] * 16777216L;
+                    VL := InText[P + 5] + InText[P + 6] * 256 + InText[P + 7] * 65536 + InText[P + 8] * 16777216L;
+                    HS := ((((VS + (VL mod 256) * DfShortMul) mod 4294967291L) * 506832829) mod 4294967296L) div 8192;
+                    HL := (((VL * 1640531527) mod 4294967296L + VS * 2654435) mod 4294967296L) div 8192;
+                    DfLong[HL + 1] := P + 1 + PosBase;
+                    DfShort[HS + 1] := P + 1 + PosBase;
+                end;
+                P := NewPos - 2;
+                if (P > Pos) and (P + 8 <= InLen) then begin
+                    VS := InText[P + 1] + InText[P + 2] * 256 + InText[P + 3] * 65536 + InText[P + 4] * 16777216L;
+                    VL := InText[P + 5] + InText[P + 6] * 256 + InText[P + 7] * 65536 + InText[P + 8] * 16777216L;
+                    HS := ((((VS + (VL mod 256) * DfShortMul) mod 4294967291L) * 506832829) mod 4294967296L) div 8192;
+                    HL := (((VL * 1640531527) mod 4294967296L + VS * 2654435) mod 4294967296L) div 8192;
+                    DfLong[HL + 1] := P + 1 + PosBase;
+                    DfShort[HS + 1] := P + 1 + PosBase;
                 end;
                 VPos := -2; // VS / VL now hold P's bytes : full rebuild at the next Pos
                 Pos := NewPos;
@@ -2296,7 +2429,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
             EmitSequence(LdmStart[I], LdmLen[I], LdmOff[I]);
             Pos := LdmStart[I] + LdmLen[I];
             if NextIns < Pos then
-                NextIns := Pos;
+                SetNextIns(Pos);
         end;
         if DoubleFast then
             ParseDoubleFast(Pos, BlockEnd)
@@ -2316,6 +2449,9 @@ codeunit 51150 "TOO ZSTD Data Compression"
     local procedure FindLdmMatches(Start: Integer; BlockEnd: Integer)
     var
         H: BigInteger;
+        H1: BigInteger;
+        H2: BigInteger;
+        H3: BigInteger;
         C: Integer;
         P: Integer;
         S: Integer;
@@ -2331,7 +2467,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
         BestLen: Integer;
         BestBack: Integer;
         BestCand: Integer;
-        Same: Boolean;
+        BackLim: Integer;
         NeedInit: Boolean;
     begin
         LdmCount := 0;
@@ -2356,10 +2492,11 @@ codeunit 51150 "TOO ZSTD Data Compression"
                 Bucket := H mod 131072;
                 Tag := (H div 131072) mod 2048;
                 BestLen := 0;
-                for K := 0 to 3 do begin
-                    Slot := Bucket * 4 + K + 1;
-                    Cand := LdmPos[Slot] - 1 - PosBase;
-                    if (Cand >= 0) and (LdmTag[Slot] = Tag) then
+                Slot := Bucket * 4;
+                for K := 1 to 4 do
+                    // entry of this call (LdmPos > PosBase) with the same tag
+                    if (LdmTag[Slot + K] = Tag) and (LdmPos[Slot + K] > PosBase) then begin
+                        Cand := LdmPos[Slot + K] - 1 - PosBase;
                         if (S - Cand <= WindowSize) and (Cand < S) then
                             if InText.Substring(Cand + 1, 32) = InText.Substring(S + 1, 32) then begin
                                 L := 32;
@@ -2373,22 +2510,38 @@ codeunit 51150 "TOO ZSTD Data Compression"
                                         L += 64
                                     else
                                         break;
-                                while (InText[Cand + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) do // guard char
+                                // 4 bytes per test (reads up to 4 chars past BlockEnd : guard chars, dropped by the limit test)
+                                while (InText[Cand + L + 1] = InText[S + L + 1]) and (InText[Cand + L + 2] = InText[S + L + 2]) and
+                                    (InText[Cand + L + 3] = InText[S + L + 3]) and (InText[Cand + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
+                                do
+                                    L += 4;
+                                if (InText[Cand + L + 1] = InText[S + L + 1]) and (InText[Cand + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
+                                    L += 2;
+                                if (InText[Cand + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
                                     L += 1;
+                                // backward, down to the previous long match end / block start and the input start : 4 bytes
+                                // per bulk compare, then per byte (indexes stay >= 1 : AL evaluates both sides of 'and')
                                 Back := 0;
-                                Same := true;
-                                while Same and (S - Back > LowLimit) and (Cand - Back > 0) do
+                                BackLim := S - LowLimit;
+                                if BackLim > Cand then
+                                    BackLim := Cand;
+                                while Back + 4 <= BackLim do
+                                    if InText.Substring(Cand - Back - 3, 4) = InText.Substring(S - Back - 3, 4) then
+                                        Back += 4
+                                    else
+                                        break;
+                                while Back < BackLim do
                                     if InText[Cand - Back] = InText[S - Back] then
                                         Back += 1
                                     else
-                                        Same := false;
+                                        break;
                                 if (L + Back >= 64) and (L + Back > BestLen) then begin
                                     BestLen := L + Back;
                                     BestBack := Back;
                                     BestCand := Cand;
                                 end;
                             end;
-                end;
+                    end;
                 // insert the span start
                 Slot := Bucket * 4 + LdmNext[Bucket + 1] + 1;
                 LdmPos[Slot] := S + 1 + PosBase;
@@ -2406,13 +2559,30 @@ codeunit 51150 "TOO ZSTD Data Compression"
                 end;
             end;
 
-            // roll to the next sampled span (1 in 16) or past PEnd : 2 statements + 1 test per byte (char folded into the
-            // Gear index). Rolling at P = PEnd + 1 reads InText[PEnd + 2] <= InLen + 1 : guard char (that H is never used)
-            if not NeedInit then
+            // roll to the next sampled span (1 in 16) or past PEnd : 4 bytes per loop, 1.5 statements per byte (char folded
+            // into the Gear index), then back to the first sampled span of the 4. A loop starts at P <= PEnd and reads up
+            // to InText[PEnd + 5] <= InLen + 4 : guard chars (a sample past PEnd ends the outer loop, as P > PEnd does)
+            if not NeedInit then begin
                 repeat
-                    P += 1;
-                    H := (H * 2 + Gear[InText[P + 1] + 1]) mod 4294967296L;
-                until (H < 268435456) or (P > PEnd);
+                    H1 := (H * 2 + Gear[InText[P + 2] + 1]) mod 4294967296L;
+                    H2 := (H1 * 2 + Gear[InText[P + 3] + 1]) mod 4294967296L;
+                    H3 := (H2 * 2 + Gear[InText[P + 4] + 1]) mod 4294967296L;
+                    H := (H3 * 2 + Gear[InText[P + 5] + 1]) mod 4294967296L;
+                    P += 4;
+                until (H1 < 268435456) or (H2 < 268435456) or (H3 < 268435456) or (H < 268435456) or (P > PEnd);
+                if H1 < 268435456 then begin
+                    P -= 3;
+                    H := H1;
+                end else
+                    if H2 < 268435456 then begin
+                        P -= 2;
+                        H := H2;
+                    end else
+                        if H3 < 268435456 then begin
+                            P -= 1;
+                            H := H3;
+                        end;
+            end;
         end;
     end;
 
@@ -2670,9 +2840,11 @@ codeunit 51150 "TOO ZSTD Data Compression"
     end;
 
     /// <summary>
-    /// HufLen[S + 1] from LitHist : Huffman tree by repeated merge of the 2 lightest nodes (O(n^2), n <= 256),
-    /// then limited to 11 bits keeping the Kraft sum exactly 2^11 (lengthen the longest codes under the limit,
-    /// then shorten while there is room). HufMax = longest code.
+    /// HufLen[S + 1] from LitHist : Huffman tree by repeated merge of the 2 lightest nodes, ties to the lowest node number
+    /// (leaves in symbol order, merged nodes numbered after them). Binary min-heap of keys weight x 1024 + node (unique,
+    /// < 2^31 : weights <= 128 KB block) : the same merges as a scan of all nodes, O(n log n) instead of O(n^2). Depths top-down
+    /// (a parent is created after its children), then limited to 11 bits keeping the Kraft sum exactly 2^11 (lengthen the
+    /// longest codes under the limit, then shorten while there is room). HufMax = longest code.
     /// </summary>
     local procedure BuildHuffmanLengths(MaxSym: Integer)
     var
@@ -2680,62 +2852,82 @@ codeunit 51150 "TOO ZSTD Data Compression"
         Target: BigInteger;
         NLeaves: Integer;
         NNodes: Integer;
+        HeapN: Integer;
         A: Integer;
         B: Integer;
         N: Integer;
         S: Integer;
-        P: Integer;
-        D: Integer;
+        I: Integer;
+        J: Integer;
+        Tmp: Integer;
         Best: Integer;
         Len: Integer;
     begin
         Clear(HufLen);
+        HufMax := 0;
         for S := 0 to MaxSym do
             if LitHist[S + 1] > 0 then begin
                 NLeaves += 1;
                 LeafSym[NLeaves] := S;
-                NodeW[NLeaves] := LitHist[S + 1];
-                NodeParent[NLeaves] := 0;
-                NodeAlive[NLeaves] := true;
+                // heap insert : sift up
+                Tmp := LitHist[S + 1] * 1024 + NLeaves;
+                I := NLeaves;
+                while I > 1 do begin
+                    J := I div 2;
+                    if HeapK[J] < Tmp then
+                        break;
+                    HeapK[I] := HeapK[J];
+                    I := J;
+                end;
+                HeapK[I] := Tmp;
             end;
+        if NLeaves = 0 then
+            exit;
         NNodes := NLeaves;
-        while NNodes < 2 * NLeaves - 1 do begin
-            A := 0;
-            B := 0;
-            for N := 1 to NNodes do
-                if NodeAlive[N] then
-                    if A = 0 then
-                        A := N
-                    else
-                        if NodeW[N] < NodeW[A] then begin
-                            B := A;
-                            A := N;
-                        end else
-                            if B = 0 then
-                                B := N
-                            else
-                                if NodeW[N] < NodeW[B] then
-                                    B := N;
-            NNodes += 1;
-            NodeW[NNodes] := NodeW[A] + NodeW[B];
-            NodeParent[NNodes] := 0;
-            NodeAlive[NNodes] := true;
-            NodeParent[A] := NNodes;
-            NodeParent[B] := NNodes;
-            NodeAlive[A] := false;
-            NodeAlive[B] := false;
-        end;
-        HufMax := 0;
-        for N := 1 to NLeaves do begin
-            D := 0;
-            P := N;
-            while NodeParent[P] <> 0 do begin
-                P := NodeParent[P];
-                D += 1;
+        HeapN := NLeaves;
+        while HeapN > 1 do begin
+            // pop the lightest A (the last key sifts down), then B = the new top is replaced by the merged node
+            A := HeapK[1];
+            Tmp := HeapK[HeapN];
+            HeapN -= 1;
+            I := 1;
+            while I * 2 <= HeapN do begin
+                J := I * 2;
+                if J < HeapN then
+                    if HeapK[J + 1] < HeapK[J] then
+                        J += 1;
+                if HeapK[J] > Tmp then
+                    break;
+                HeapK[I] := HeapK[J];
+                I := J;
             end;
-            HufLen[LeafSym[N] + 1] := D;
-            if D > HufMax then
-                HufMax := D;
+            HeapK[I] := Tmp;
+            B := HeapK[1];
+            NNodes += 1;
+            NodeParent[A mod 1024] := NNodes;
+            NodeParent[B mod 1024] := NNodes;
+            Tmp := (A div 1024 + B div 1024) * 1024 + NNodes;
+            I := 1;
+            while I * 2 <= HeapN do begin
+                J := I * 2;
+                if J < HeapN then
+                    if HeapK[J + 1] < HeapK[J] then
+                        J += 1;
+                if HeapK[J] > Tmp then
+                    break;
+                HeapK[I] := HeapK[J];
+                I := J;
+            end;
+            HeapK[I] := Tmp;
+        end;
+        // depths : the root is the last node
+        NodeDepth[NNodes] := 0;
+        for N := NNodes - 1 downto 1 do
+            NodeDepth[N] := NodeDepth[NodeParent[N]] + 1;
+        for N := 1 to NLeaves do begin
+            HufLen[LeafSym[N] + 1] := NodeDepth[N];
+            if NodeDepth[N] > HufMax then
+                HufMax := NodeDepth[N];
         end;
         if HufMax <= 11 then
             exit;

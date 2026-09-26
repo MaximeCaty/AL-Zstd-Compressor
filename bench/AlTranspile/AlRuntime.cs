@@ -36,7 +36,7 @@ public struct ALText
     public int Length => S.Length;
     public ALChar this[long i]
     {
-        get { if (i < 1 || i > S.Length) throw new ALError($"Text index {i} out of range 1..{S.Length}"); return S[(int)i - 1]; }
+        get { if (i < 1 || i > S.Length) throw new ALError($"Text index {i} out of range 1..{S.Length}"); ALRt.TextReads++; return S[(int)i - 1]; }
         set { if (i < 1 || i > S.Length) throw new ALError($"Text index {i} out of range"); var c = S.ToCharArray(); c[i - 1] = (char)value.V; s = new string(c); }
     }
     public ALText Substring(long start, long len)
@@ -66,8 +66,8 @@ public sealed class ALArray<T> : IEnumerable<T>
     public ALArray(int size) { n = size; a = new T[size + 1]; }
     public T this[long i]
     {
-        get { if (i < 1 || i > n) throw new ALError($"array index {i} out of range 1..{n}"); return a[i]; }
-        set { if (i < 1 || i > n) throw new ALError($"array index {i} out of range 1..{n}"); a[i] = value; }
+        get { if (i < 1 || i > n) throw new ALError($"array index {i} out of range 1..{n}"); ALRt.ArrayOps++; return a[i]; }
+        set { if (i < 1 || i > n) throw new ALError($"array index {i} out of range 1..{n}"); ALRt.ArrayOps++; a[i] = value; }
     }
     public void Clear() => Array.Clear(a);
     public IEnumerator<T> GetEnumerator() => a.Skip(1).GetEnumerator();
@@ -98,9 +98,11 @@ public sealed class ALTextBuilder
 
 public static class ALRt
 {
-    // statement / call counters per procedure (al2cs.py --count) : AL StmtHit model
-    public static readonly long[] S = new long[512], Calls = new long[512];
-    public static bool H(int pid) { S[pid]++; return true; }
+    // statement / call counters per procedure and statements per AL source line (al2cs.py --count) : AL StmtHit model
+    public static readonly long[] S = new long[512], Calls = new long[512], LS = new long[65536];
+    public static bool H(int pid, int ln) { S[pid]++; LS[ln]++; return true; }
+    // Text[i] reads and array accesses (not per procedure) : second-order costs of the time model
+    public static long TextReads, ArrayOps;
     public static int I(long v) => checked((int)v);
     public static long L(long v) => v;
     public static ALChar C(long v) => new ALChar(checked((int)v));

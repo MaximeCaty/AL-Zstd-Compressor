@@ -19,13 +19,15 @@ TOK = re.compile(r"""
     (?P<str>'(?:[^']|'')*')|(?P<qid>"[^"]*")|(?P<num>\d+L?)|(?P<id>[A-Za-z_][A-Za-z0-9_]*)|
     (?P<op>:=|\+=|-=|\*=|/=|::|<>|<=|>=|\.\.|[()\[\];,:.+\-*/=<>{}])""", re.S | re.X)
 
-def tokenize(src):
+def tokenize(src):  # tokens (kind, value, AL source line)
     out = []
+    line = 1; last = 0
     for m in TOK.finditer(src):
         k = m.lastgroup
         if k in ('ws', 'lc', 'bc', 'pp'):
             continue
-        out.append((k, m.group(k)))
+        line += src.count('\n', last, m.start()); last = m.start()
+        out.append((k, m.group(k), line))
     return out
 
 KW = {'begin', 'end', 'if', 'then', 'else', 'while', 'do', 'repeat', 'until', 'for', 'to', 'downto', 'case', 'of',
@@ -35,7 +37,7 @@ class P:
     def __init__(self, toks):
         self.t = toks; self.i = 0
     def peek(self, k=0):
-        return self.t[self.i + k] if self.i + k < len(self.t) else ('eof', '')
+        return self.t[self.i + k] if self.i + k < len(self.t) else ('eof', '', 0)
     def v(self, k=0):
         tk = self.peek(k); return tk[1].lower() if tk[0] == 'id' else tk[1]
     def next(self):
@@ -121,11 +123,11 @@ class Tr:
         self.globals = {}; self.procs = {}; self.out = []; self.tmp = 0; self.enums = enums
         self.count = count; self.pnames = []; self.pid = 0
 
-    def hit(self):  # statement counter (AL StmtHit) of the current procedure, as a C# bool term
-        return f"ALRt.H({self.pid}) & " if self.count else ""
+    def hit(self, ln):  # statement counter (AL StmtHit) of the current procedure and AL line, as a C# bool term
+        return f"ALRt.H({self.pid}, {ln}) & " if self.count else ""
 
-    def cnt(self, pad):
-        return [pad + f"ALRt.S[{self.pid}]++;"] if self.count else []
+    def cnt(self, pad, ln):
+        return [pad + f"ALRt.S[{self.pid}]++; ALRt.LS[{ln}]++;"] if self.count else []
 
     def fresh(self):
         self.tmp += 1; return f"__t{self.tmp}"
@@ -242,13 +244,13 @@ class Tr:
 
     def stmt(self, p, ind):
         pad = '    ' * ind
-        w = p.v()
+        w = p.v(); ln = p.peek()[2]
         if w == 'begin':
             p.next(); s = self.stmts(p, ('end',), ind); p.expect('end')
             return [pad + '{'] + s + [pad + '}']
         if w == 'if':
             p.next(); c = self.expr(p); p.expect('then')
-            res = [pad + f"if ({self.hit()}({c}))"]
+            res = [pad + f"if ({self.hit(ln)}({c}))"]
             if p.v() == 'else':
                 res += [pad + '{', pad + '}']
             else:
@@ -258,16 +260,16 @@ class Tr:
             return res
         if w == 'while':
             p.next(); c = self.expr(p); p.expect('do')
-            return [pad + f"while ({self.hit()}({c}))"] + self.block(p, ind)
+            return [pad + f"while ({self.hit(ln)}({c}))"] + self.block(p, ind)
         if w == 'repeat':
-            p.next(); s = self.stmts(p, ('until',), ind + 1); p.expect('until'); c = self.expr(p)
-            return [pad + 'do', pad + '{'] + s + [pad + f"}} while (!({self.hit()}({c})));"]
+            p.next(); s = self.stmts(p, ('until',), ind + 1); ln = p.peek()[2]; p.expect('until'); c = self.expr(p)
+            return [pad + 'do', pad + '{'] + s + [pad + f"}} while (!({self.hit(ln)}({c})));"]
         if w == 'for':
             p.next(); var = p.next()[1]; p.expect(':='); a = self.expr(p)
             down = p.v() == 'downto'; p.next(); b = self.expr(p); p.expect('do')
             t = self.fresh(); vn, vt = self.lookup(var)
             head = [pad + '{', pad + f"    long {t} = {b};",
-                    pad + f"    for ({vn} = ALRt.I({a}); {self.hit()}({vn} {'>=' if down else '<='} {t}); {vn}{'--' if down else '++'})"]
+                    pad + f"    for ({vn} = ALRt.I({a}); {self.hit(ln)}({vn} {'>=' if down else '<='} {t}); {vn}{'--' if down else '++'})"]
             return head + self.block(p, ind + 1) + [pad + '}']
         if w == 'foreach':
             p.next(); var = p.next()[1]; p.expect('in'); coll = self.expr(p); p.expect('do')
@@ -276,7 +278,7 @@ class Tr:
         if w == 'case':
             p.next(); e = self.expr(p); p.expect('of')
             t = self.fresh()
-            res = [pad + '{'] + self.cnt(pad + '    ') + [pad + f"    var {t} = {e};"]
+            res = [pad + '{'] + self.cnt(pad + '    ', ln) + [pad + f"    var {t} = {e};"]
             first = True
             while p.v() not in ('end', 'else'):
                 vals = [self.expr(p)]
@@ -296,10 +298,10 @@ class Tr:
             p.next()
             if p.accept('('):
                 e = self.expr(p); p.expect(')')
-                return self.cnt(pad) + [pad + f"return {conv(self.ret, e)};"]
-            return self.cnt(pad) + [pad + (f"return {self.retname};" if self.retname else "return;")]
+                return self.cnt(pad, ln) + [pad + f"return {conv(self.ret, e)};"]
+            return self.cnt(pad, ln) + [pad + (f"return {self.retname};" if self.retname else "return;")]
         if w == 'break':
-            p.next(); return self.cnt(pad) + [pad + 'break;']
+            p.next(); return self.cnt(pad, ln) + [pad + 'break;']
         # assignment or call
         lhs_i = p.i
         lhs = self.expr(p, lvalue=True)
@@ -310,9 +312,9 @@ class Tr:
             if op != ':=':
                 rhs = f"{lhs} {op[0]} ({rhs})"
             if ischar:
-                return self.cnt(pad) + [pad + f"{lhs} = ALRt.C({rhs});"]
-            return self.cnt(pad) + [pad + f"{lhs} = {conv(t, rhs)};"]
-        return self.cnt(pad) + [pad + lhs + ';']
+                return self.cnt(pad, ln) + [pad + f"{lhs} = ALRt.C({rhs});"]
+            return self.cnt(pad, ln) + [pad + f"{lhs} = {conv(t, rhs)};"]
+        return self.cnt(pad, ln) + [pad + lhs + ';']
 
     def lookup(self, name):
         k = name.lower()
@@ -375,7 +377,7 @@ class Tr:
 
     def postfix(self, p):
         tk = p.next()
-        k, val = tk
+        k, val = tk[0], tk[1]
         typ = None
         if k == 'num':
             e = val

@@ -9,6 +9,6 @@
     <NoWarn>CS0660;CS0661</NoWarn>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Remove="zstd/**" />
+    <Compile Include="../AlRuntime.cs" />
   </ItemGroup>
 </Project>
