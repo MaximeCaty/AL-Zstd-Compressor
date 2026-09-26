@@ -59,3 +59,19 @@ previous bytes, 4 modes, greedy clustering into trees. It reports the size that 
 commands per byte that drive the AL decoder cost model. Corpus result (Heavy parse): zstd -13.3 % vs GZip, with
 context-modeled literals -15.3 % (binary DB -9.9 → -14.9 %, files ≤ 256 KB -3.3 → -5.7 %). Real brotli q9 reaches -17.9 %;
 the rest is its static dictionary and command coding.
+
+## AL-style Brotli (`BrotliAl.cs`, `--brotli-al`)
+
+A Brotli (RFC 7932) encoder and decoder written AL-style, with statement counts.
+- Encoder: the AL zstd parser (`ParseHook`, same matches and parse cost) feeding Brotli commands, in 1 MB meta-blocks.
+  Literals use 64 contexts and one of 4 modes, with the contexts clustered into prefix codes; distances use short codes
+  from the 4-distance ring. Prefix codes are simple or complex; a meta-block that doesn't beat raw size is stored
+  uncompressed.
+- Decoder: full RFC 7932, including the static dictionary (`brotli-dictionary.bin`, google/brotli, MIT) and the 121
+  transforms (`BrotliData.cs`, generated from google/brotli).
+- Checks: our streams decode with .NET `BrotliDecoder`, and our decoder reads .NET `BrotliEncoder` q5 / q9 streams
+  (dictionary words and block switches included).
+
+Corpus results (54 MB, Heavy parse): -15.9 % vs GZip (zstd AL -13.3 %, real Brotli q9 -17.9 %). Modelled AL speed:
+encode ~385 ms/MB (zstd ~277), decode ~73 ms/MB (zstd ~60, same unit costs). With the Medium parse: -14.9 %, encode
+~333 ms/MB.

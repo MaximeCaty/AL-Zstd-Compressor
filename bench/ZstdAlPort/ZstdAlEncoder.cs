@@ -103,6 +103,7 @@ public sealed class ZstdAlEncoder
     readonly int[] LdmStart = new int[2101], LdmLen = new int[2101], LdmOff = new int[2101];
     int LitCount, NbSeq;
     readonly int[] SeqLL = new int[44001], SeqML = new int[44001], SeqOfv = new int[44001];
+    public readonly int[] SeqOff = new int[44001]; // actual offset of each sequence (for other back ends)
     readonly int[] SeqLLCode = new int[44001], SeqMLCode = new int[44001], SeqOFCode = new int[44001];
     readonly int[] LLCodeTbl = new int[65], MLCodeTbl = new int[129];
     int PRep1, PRep2, PRep3;
@@ -118,6 +119,11 @@ public sealed class ZstdAlEncoder
 
     public Stats Stats = new();
     public bool BrotliEstimate;
+    /// <summary>Parse-only mode : called per block after FindSequences with (encoder, block start, block size) ; no zstd entropy stage.</summary>
+    public Action<ZstdAlEncoder, int, int> ParseHook;
+    public int SeqCount => NbSeq;
+    public int SeqLitLen(int i) => SeqLL[i];
+    public int SeqMatchLen(int i) => SeqML[i];
 
     static readonly int[] LLBaseTok = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
     static readonly int[] LLBitsTok = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
@@ -153,6 +159,7 @@ public sealed class ZstdAlEncoder
         Rep1 = 1; Rep2 = 4; Rep3 = 8;
         Array.Clear(ComValid);
         WindowSize = (int)Pow2B[WindowLog + 1];
+        if (ParseHook != null) WindowSize = (1 << 24) - 16; // brotli : max backward distance 2^WBITS - 16
         singleSegment = InLen <= WindowSize;
         WriteFrameHeader(singleSegment);
         if (singleSegment || WindowSize > 131072) WriteBlocks(131072); else WriteBlocks(WindowSize);
@@ -314,7 +321,7 @@ public sealed class ZstdAlEncoder
             if (size > blockMax) size = blockMax;
             bool lastBlock = pos + size >= InLen;
             bool isRun = false;
-            if (size >= 2)
+            if (size >= 2 && ParseHook == null)
                 if (T[pos + 2] == T[pos + 1] && T[pos + size] == T[pos + 1] && T[pos + size / 2 + 1] == T[pos + 1])
                     isRun = AllEqual(T, pos + 1, size, T[pos + 1]);
             if (isRun)
@@ -343,6 +350,14 @@ public sealed class ZstdAlEncoder
     bool TryCompressedBlock(int start, int size, bool lastBlock)
     {
         if (MaxStage < 3) return false;
+        if (ParseHook != null)
+        {
+            // parse only : the sequences go to another back end (brotli), the repeat history is committed
+            FindSequences(start, size);
+            ParseHook(this, start, size);
+            Rep1 = PRep1; Rep2 = PRep2; Rep3 = PRep3;
+            return true;
+        }
         BlockTB.Clear();
         FindSequences(start, size);
         Lit = new byte[LitTB.Length + 2];
@@ -570,7 +585,7 @@ public sealed class ZstdAlEncoder
                     }
                 }
                 NbSeq++;
-                SeqLL[NbSeq] = LL; SeqML[NbSeq] = BestLen; SeqOfv[NbSeq] = OV;
+                SeqLL[NbSeq] = LL; SeqML[NbSeq] = BestLen; SeqOfv[NbSeq] = OV; SeqOff[NbSeq] = BestOff;
                 SeqAnchor = Pos + BestLen;
                 Pos += BestLen;
                 Lazy = false;
@@ -666,7 +681,7 @@ public sealed class ZstdAlEncoder
                     }
                 }
                 NbSeq++;
-                SeqLL[NbSeq] = LL; SeqML[NbSeq] = ML; SeqOfv[NbSeq] = OV;
+                SeqLL[NbSeq] = LL; SeqML[NbSeq] = ML; SeqOfv[NbSeq] = OV; SeqOff[NbSeq] = Off;
                 NewPos = MStart + ML;
                 SeqAnchor = NewPos;
 
@@ -796,7 +811,7 @@ public sealed class ZstdAlEncoder
             }
         }
         NbSeq++;
-        SeqLL[NbSeq] = ll; SeqML[NbSeq] = ml; SeqOfv[NbSeq] = ov;
+        SeqLL[NbSeq] = ll; SeqML[NbSeq] = ml; SeqOfv[NbSeq] = ov; SeqOff[NbSeq] = off;
         SeqAnchor = pos + ml;
     }
 
