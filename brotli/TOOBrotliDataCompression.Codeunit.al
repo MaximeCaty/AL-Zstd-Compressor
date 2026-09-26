@@ -5,9 +5,9 @@
       BrotliStream, browsers, brotli CLI). Window up to 16 MB (WBITS 16..24 by input size).
       Parser : the lazy / double fast parser of codeunit "TOO ZSTD Data Compression" (same levels, same profiles, same
       matches), then a brotli back end :
-        - meta-blocks of up to 1 MB, one block type per category (no block switching), NPOSTFIX = NDIRECT = 0 ;
+        - meta-blocks of up to 4 MB, one block type per category (no block switching), NPOSTFIX = NDIRECT = 0 ;
         - literals : 64 contexts of the 2 previous bytes, context mode chosen per meta-block (LSB6 / MSB6 / UTF8 / SIGNED,
-          estimate on 1 literal in 4), contexts clustered into prefix codes (greedy pair merge while it saves bits) ;
+          estimate on 1 literal in 8), contexts clustered into prefix codes (greedy pair merge while it saves bits) ;
         - distances : the 16 short codes against the 4-distance ring, implicit distance 0 in command codes 0-127 ;
         - prefix codes : simple (<= 4 symbols) or complex (code length code, zero runs with code 17), lengths <= 15 ;
         - a meta-block that does not beat its raw size is stored uncompressed.
@@ -127,15 +127,13 @@ codeunit 51160 "TOO Brotli Data Compression"
         CmdDCode: array[300000] of Integer; // distance symbol, -1 = none (implicit or end of meta-block)
         CmdDBits: array[300000] of Integer;
         CmdDExtra: array[300000] of Integer;
-        DBits: Integer;
-        DExtra: Integer;
         CmdHist: array[710] of Integer;
         DistHist: array[710] of Integer;
         CmdLen: array[710] of Integer;
         CmdCd: array[710] of Integer;
         DistLen: array[710] of Integer;
         DistCd: array[710] of Integer;
-        ModeHist: array[65536] of Integer; // [Mode * 16384 + Ctx * 256 + Byte + 1], 1 literal in 4
+        ModeHist: array[65536] of Integer; // [Mode * 16384 + Ctx * 256 + Byte + 1], 1 literal in 8
         CtxHist: array[16384] of Integer; // [Ctx * 256 + Byte + 1] ; cluster rows after merging
         CMap: array[64] of Integer; // context -> tree
         NTrees: Integer;
@@ -155,7 +153,8 @@ codeunit 51160 "TOO Brotli Data Compression"
         LeafSym: array[710] of Integer;
         NodeW: array[1420] of BigInteger;
         NodeParent: array[1420] of Integer;
-        NodeAlive: array[1420] of Boolean;
+        NodeDepth: array[1420] of Integer;
+        Heap: array[710] of Integer; // node ids, min-heap on NodeW
         BlCount: array[16] of Integer;
         NextCode: array[16] of Integer;
         ClHist: array[710] of Integer;
@@ -294,7 +293,7 @@ codeunit 51160 "TOO Brotli Data Compression"
         MetaStart := 0;
         MetaLen := 0;
         PendingLits := 0;
-        // parse per 128 KB block (the zstd block size of the parser), commands gathered into meta-blocks of 1 MB
+        // parse per 128 KB block (the zstd block size of the parser), commands gathered into meta-blocks of 4 MB
         Pos := 0;
         while Pos < InLen do begin
             Size := InLen - Pos;
@@ -306,7 +305,7 @@ codeunit 51160 "TOO Brotli Data Compression"
             Rep3 := PRep3;
             AddBlockCommands(Pos, Size);
             Pos += Size;
-            if (MetaLen >= 1048576) or (NCmd > 250000) then
+            if (MetaLen >= 4194304) or (NCmd > 250000) then
                 FlushMetaBlock();
         end;
         if PendingLits > 0 then begin
@@ -351,6 +350,9 @@ codeunit 51160 "TOO Brotli Data Compression"
         ReadInput(Source);
         if InLen = 0 then
             Error(CorruptErr);
+        // guard chars past the input (InLen unchanged) : the bit reader loads 3 bytes per step without a bound test
+        for I := 1 to 16 do
+            InText += CharTbl[1];
         Clear(Writer);
         Latin1.ISO88591();
         Writer.StreamWriter(Target, Latin1);
@@ -876,61 +878,6 @@ codeunit 51160 "TOO Brotli Data Compression"
         NCmd := 0;
     end;
 
-    /// <summary>Distance symbol for D : short codes 0-15 against the ring, else 16 + 2 x (nbits - 1) + prefix bit (DBits, DExtra).</summary>
-    local procedure DistCode(D: Integer): Integer
-    var
-        Last: Integer;
-        Second: Integer;
-        DD: Integer;
-        NBits: Integer;
-    begin
-        DBits := 0;
-        DExtra := 0;
-        Last := Rb[(RbIdx + 3) mod 4 + 1];
-        Second := Rb[(RbIdx + 2) mod 4 + 1];
-        if D = Last then
-            exit(0);
-        if D = Second then
-            exit(1);
-        if D = Rb[(RbIdx + 1) mod 4 + 1] then
-            exit(2);
-        if D = Rb[RbIdx + 1] then
-            exit(3);
-        case D - Last of
-            -1:
-                exit(4);
-            1:
-                exit(5);
-            -2:
-                exit(6);
-            2:
-                exit(7);
-            -3:
-                exit(8);
-            3:
-                exit(9);
-        end;
-        case D - Second of
-            -1:
-                exit(10);
-            1:
-                exit(11);
-            -2:
-                exit(12);
-            2:
-                exit(13);
-            -3:
-                exit(14);
-            3:
-                exit(15);
-        end;
-        DD := D + 3; // NPOSTFIX = NDIRECT = 0
-        NBits := HighBit(DD) - 1;
-        DBits := NBits;
-        DExtra := DD mod Pow2B[NBits + 1];
-        exit(16 + 2 * (NBits - 1) + (DD div Pow2B[NBits + 1]) mod 2);
-    end;
-
     local procedure InsCode(V: Integer) Code: Integer
     begin
         if V < 2048 then
@@ -978,6 +925,11 @@ codeunit 51160 "TOO Brotli Data Compression"
         B: Integer;
         Idx: Integer;
         Nib: Integer;
+        D: Integer;
+        DD: Integer;
+        NBits: Integer;
+        Last: Integer;
+        Second: Integer;
     begin
         MarkLen := OutTB.Length();
         MarkAcc := BwAcc;
@@ -1000,9 +952,67 @@ codeunit 51160 "TOO Brotli Data Compression"
                 CC := CopyCode(CmdCopy[K]);
             DC := -1; // -1 : no distance (insert-only tail : the meta-block ends in its literals)
             if CmdCopy[K] > 0 then begin
-                DC := DistCode(CmdDist[K]);
-                CmdDBits[K] := DBits;
-                CmdDExtra[K] := DExtra;
+                // distance symbol : short codes 0-15 against the ring, else 16 + 2 x (nbits - 1) + prefix bit
+                D := CmdDist[K];
+                CmdDBits[K] := 0; // short codes : no extra bits
+                CmdDExtra[K] := 0;
+                Last := Rb[(RbIdx + 3) mod 4 + 1];
+                Second := Rb[(RbIdx + 2) mod 4 + 1];
+                if D = Last then
+                    DC := 0
+                else
+                    if D = Second then
+                        DC := 1
+                    else
+                        if D = Rb[(RbIdx + 1) mod 4 + 1] then
+                            DC := 2
+                        else
+                            if D = Rb[RbIdx + 1] then
+                                DC := 3
+                            else begin
+                                case D - Last of
+                                    -1:
+                                        DC := 4;
+                                    1:
+                                        DC := 5;
+                                    -2:
+                                        DC := 6;
+                                    2:
+                                        DC := 7;
+                                    -3:
+                                        DC := 8;
+                                    3:
+                                        DC := 9;
+                                end;
+                                if DC < 0 then
+                                    case D - Second of
+                                        -1:
+                                            DC := 10;
+                                        1:
+                                            DC := 11;
+                                        -2:
+                                            DC := 12;
+                                        2:
+                                            DC := 13;
+                                        -3:
+                                            DC := 14;
+                                        3:
+                                            DC := 15;
+                                    end;
+                                if DC < 0 then begin
+                                    DD := D + 3; // NPOSTFIX = NDIRECT = 0 ; nbits = highbit(DD) - 1 by table
+                                    if DD < 1024 then
+                                        NBits := HBTbl[DD] - 1
+                                    else
+                                        if DD < 1048576 then
+                                            NBits := HBTbl[DD div 1024] + 9
+                                        else
+                                            NBits := HBTbl[DD div 1048576] + 19;
+                                    CmdDBits[K] := NBits;
+                                    CmdDExtra[K] := DD mod Pow2B[NBits + 1];
+                                    DC := 16 + 2 * (NBits - 1) + (DD div Pow2B[NBits + 1]) mod 2;
+                                end;
+                            end;
                 if DC <> 0 then begin
                     Rb[RbIdx + 1] := CmdDist[K];
                     RbIdx := (RbIdx + 1) mod 4;
@@ -1184,7 +1194,7 @@ codeunit 51160 "TOO Brotli Data Compression"
     end;
 
     /// <summary>
-    /// Literal context mode of the meta-block : histograms of 1 literal in 4 under the 4 modes, cost = per-context entropy +
+    /// Literal context mode of the meta-block : histograms of 1 literal in 8 under the 4 modes, cost = per-context entropy +
     /// ~(30 + 4 x used symbols) bits per used context ; the cheapest mode wins.
     /// </summary>
     local procedure ChooseMode(): Integer
@@ -1227,7 +1237,7 @@ codeunit 51160 "TOO Brotli Data Compression"
                 ModeHist[16384 + OrTbl[CtxLut[256 + C1 + 1] * 64 + CtxLut2[256 + C2 + 1] + 1] * 256 + Byte0 + 1] += 1;
                 ModeHist[32768 + OrTbl[CtxLut[512 + C1 + 1] * 64 + CtxLut2[512 + C2 + 1] + 1] * 256 + Byte0 + 1] += 1;
                 ModeHist[49152 + OrTbl[CtxLut[768 + C1 + 1] * 64 + CtxLut2[768 + C2 + 1] + 1] * 256 + Byte0 + 1] += 1;
-                Q += 4;
+                Q += 8;
             end;
             P += CmdIns[K] + CmdCopy[K];
         end;
@@ -1494,9 +1504,9 @@ codeunit 51160 "TOO Brotli Data Compression"
     end;
 
     /// <summary>
-    /// Huffman code lengths of Hist (AlphaSize symbols) into Len : tree by repeated merge of the 2 lightest nodes (O(n^2)),
-    /// then limited to MaxLen keeping the Kraft sum exact (lengthen the longest codes under the limit, then shorten while
-    /// there is room) ; the zstd codec's BuildHuffmanLengths with a MaxLen parameter.
+    /// Huffman code lengths of Hist (AlphaSize symbols) into Len : binary min-heap of node weights (O(n log n)), depths
+    /// top-down from the root (a parent is always created after its children), then limited to MaxLen keeping the Kraft
+    /// sum exact (lengthen the longest codes under the limit, then shorten while there is room).
     /// </summary>
     local procedure BuildLengths(var Hist: array[710] of Integer; var Len: array[710] of Integer; AlphaSize: Integer; MaxLen: Integer)
     var
@@ -1504,12 +1514,14 @@ codeunit 51160 "TOO Brotli Data Compression"
         Target: BigInteger;
         NLeaves: Integer;
         NNodes: Integer;
+        HeapN: Integer;
         A: Integer;
         B: Integer;
         N: Integer;
         S: Integer;
-        P: Integer;
-        D: Integer;
+        I: Integer;
+        J: Integer;
+        Tmp: Integer;
         Best: Integer;
         L: Integer;
         MaxD: Integer;
@@ -1520,8 +1532,17 @@ codeunit 51160 "TOO Brotli Data Compression"
                 NLeaves += 1;
                 LeafSym[NLeaves] := S;
                 NodeW[NLeaves] := Hist[S + 1];
-                NodeParent[NLeaves] := 0;
-                NodeAlive[NLeaves] := true;
+                // heap insert : sift up
+                HeapN += 1;
+                I := HeapN;
+                while I > 1 do begin
+                    J := I div 2;
+                    if NodeW[Heap[J]] <= NodeW[NLeaves] then
+                        break;
+                    Heap[I] := Heap[J];
+                    I := J;
+                end;
+                Heap[I] := NLeaves;
             end;
         end;
         if NLeaves < 2 then begin
@@ -1530,42 +1551,65 @@ codeunit 51160 "TOO Brotli Data Compression"
             exit;
         end;
         NNodes := NLeaves;
-        while NNodes < 2 * NLeaves - 1 do begin
-            A := 0;
-            B := 0;
-            for N := 1 to NNodes do
-                if NodeAlive[N] then
-                    if A = 0 then
-                        A := N
-                    else
-                        if NodeW[N] < NodeW[A] then begin
-                            B := A;
-                            A := N;
-                        end else
-                            if B = 0 then
-                                B := N
-                            else
-                                if NodeW[N] < NodeW[B] then
-                                    B := N;
+        while HeapN > 1 do begin
+            // 2 lightest nodes : pop A, pop B (sift down)
+            A := Heap[1];
+            Heap[1] := Heap[HeapN];
+            HeapN -= 1;
+            Tmp := Heap[1];
+            I := 1;
+            while I * 2 <= HeapN do begin
+                J := I * 2;
+                if J < HeapN then
+                    if NodeW[Heap[J + 1]] < NodeW[Heap[J]] then
+                        J += 1;
+                if NodeW[Heap[J]] >= NodeW[Tmp] then
+                    break;
+                Heap[I] := Heap[J];
+                I := J;
+            end;
+            Heap[I] := Tmp;
+            B := Heap[1];
+            Heap[1] := Heap[HeapN];
+            HeapN -= 1;
+            Tmp := Heap[1];
+            I := 1;
+            while I * 2 <= HeapN do begin
+                J := I * 2;
+                if J < HeapN then
+                    if NodeW[Heap[J + 1]] < NodeW[Heap[J]] then
+                        J += 1;
+                if NodeW[Heap[J]] >= NodeW[Tmp] then
+                    break;
+                Heap[I] := Heap[J];
+                I := J;
+            end;
+            if HeapN >= 1 then
+                Heap[I] := Tmp;
+            // merged node, pushed back : sift up
             NNodes += 1;
             NodeW[NNodes] := NodeW[A] + NodeW[B];
-            NodeParent[NNodes] := 0;
-            NodeAlive[NNodes] := true;
             NodeParent[A] := NNodes;
             NodeParent[B] := NNodes;
-            NodeAlive[A] := false;
-            NodeAlive[B] := false;
-        end;
-        for N := 1 to NLeaves do begin
-            D := 0;
-            P := N;
-            while NodeParent[P] <> 0 do begin
-                P := NodeParent[P];
-                D += 1;
+            HeapN += 1;
+            I := HeapN;
+            while I > 1 do begin
+                J := I div 2;
+                if NodeW[Heap[J]] <= NodeW[NNodes] then
+                    break;
+                Heap[I] := Heap[J];
+                I := J;
             end;
-            Len[LeafSym[N] + 1] := D;
-            if D > MaxD then
-                MaxD := D;
+            Heap[I] := NNodes;
+        end;
+        // depths : the root is the last node, every parent id is larger than its children
+        NodeDepth[NNodes] := 0;
+        for N := NNodes - 1 downto 1 do
+            NodeDepth[N] := NodeDepth[NodeParent[N]] + 1;
+        for N := 1 to NLeaves do begin
+            Len[LeafSym[N] + 1] := NodeDepth[N];
+            if NodeDepth[N] > MaxD then
+                MaxD := NodeDepth[N];
         end;
         if MaxD <= MaxLen then
             exit;
@@ -2576,6 +2620,8 @@ codeunit 51160 "TOO Brotli Data Compression"
         NDB: Integer;
         MaxDist: BigInteger;
         Total: BigInteger;
+        OutLen: Integer;
+        Chunk: Text;
     begin
         TNext := 0;
         ReadBlockState(1);
@@ -2605,8 +2651,11 @@ codeunit 51160 "TOO Brotli Data Compression"
             end;
             // HOT-INLINE copy of DecodeSym(CmdTreeOff[...])
             T := CmdTreeOff[BlkType[2] + 1];
-            if BrCnt < 15 then
-                Refill();
+            if BrCnt < 15 then begin
+                BrAcc += (InText[InPos] + InText[InPos + 1] * 256 + InText[InPos + 2] * 65536) * Pow2B[BrCnt + 1];
+                InPos += 3;
+                BrCnt += 24;
+            end;
             K := BrAcc mod 256;
             L := TLen[T + K + 1];
             V := TVal[T + K + 1];
@@ -2624,8 +2673,11 @@ codeunit 51160 "TOO Brotli Data Compression"
             InsLen := InsBase[IC + 1];
             E := InsExtra[IC + 1];
             if E > 0 then begin
-                if BrCnt < E then
-                    Refill();
+                if BrCnt < E then begin
+                    BrAcc += (InText[InPos] + InText[InPos + 1] * 256 + InText[InPos + 2] * 65536) * Pow2B[BrCnt + 1];
+                    InPos += 3;
+                    BrCnt += 24;
+                end;
                 InsLen += BrAcc mod Pow2B[E + 1];
                 BrAcc := BrAcc div Pow2B[E + 1];
                 BrCnt -= E;
@@ -2633,8 +2685,11 @@ codeunit 51160 "TOO Brotli Data Compression"
             CopyLen := CopyBase[CC + 1];
             E := CopyExtra[CC + 1];
             if E > 0 then begin
-                if BrCnt < E then
-                    Refill();
+                if BrCnt < E then begin
+                    BrAcc += (InText[InPos] + InText[InPos + 1] * 256 + InText[InPos + 2] * 65536) * Pow2B[BrCnt + 1];
+                    InPos += 3;
+                    BrCnt += 24;
+                end;
                 CopyLen += BrAcc mod Pow2B[E + 1];
                 BrAcc := BrAcc div Pow2B[E + 1];
                 BrCnt -= E;
@@ -2650,8 +2705,11 @@ codeunit 51160 "TOO Brotli Data Compression"
                 for I := 1 to Lits do begin
                     // HOT-INLINE copy of DecodeSym : tree of the context of the 2 previous bytes
                     T := LitTreeOff[CMapL[CBase + OrTbl[CtxLut[ModeOff + P1 + 1] * 64 + CtxLut2[ModeOff + P2 + 1] + 1] + 1] + 1];
-                    if BrCnt < 15 then
-                        Refill();
+                    if BrCnt < 15 then begin
+                        BrAcc += (InText[InPos] + InText[InPos + 1] * 256 + InText[InPos + 2] * 65536) * Pow2B[BrCnt + 1];
+                        InPos += 3;
+                        BrCnt += 24;
+                    end;
                     K := BrAcc mod 256;
                     L := TLen[T + K + 1];
                     V := TVal[T + K + 1];
@@ -2707,7 +2765,23 @@ codeunit 51160 "TOO Brotli Data Compression"
                         DCtx := 3
                     else
                         DCtx := CopyLen - 2;
-                    DCode := DecodeSym(DistTreeOff[CMapD[BlkType[3] * 4 + DCtx + 1] + 1]);
+                    // HOT-INLINE copy of DecodeSym(DistTreeOff[...])
+                    T := DistTreeOff[CMapD[BlkType[3] * 4 + DCtx + 1] + 1];
+                    if BrCnt < 15 then begin
+                        BrAcc += (InText[InPos] + InText[InPos + 1] * 256 + InText[InPos + 2] * 65536) * Pow2B[BrCnt + 1];
+                        InPos += 3;
+                        BrCnt += 24;
+                    end;
+                    K := BrAcc mod 256;
+                    L := TLen[T + K + 1];
+                    DCode := TVal[T + K + 1];
+                    if L > 100 then begin
+                        K := DCode + (BrAcc div 256) mod Pow2B[L - 100 + 1];
+                        L := TLen[K + 1];
+                        DCode := TVal[K + 1];
+                    end;
+                    BrAcc := BrAcc div Pow2B[L + 1];
+                    BrCnt -= L;
                     if DCode < 16 then
                         Dist := ShortDistance(DCode)
                     else
@@ -2716,12 +2790,26 @@ codeunit 51160 "TOO Brotli Data Compression"
                         else begin
                             X := DCode - NDirect - 16;
                             NDB := 1 + X div Pow2B[NPostfix + 2];
-                            Dist := ((2 + (X div Pow2B[NPostfix + 1]) mod 2) * Pow2B[NDB + 1] - 4 + ReadBits(NDB)) * Pow2B[NPostfix + 1] +
+                            // HOT-INLINE copy of ReadBits(NDB), NDB <= 24
+                            if BrCnt < NDB then begin
+                                BrAcc += (InText[InPos] + InText[InPos + 1] * 256 + InText[InPos + 2] * 65536) * Pow2B[BrCnt + 1];
+                                InPos += 3;
+                                BrCnt += 24;
+                            end;
+                            E := BrAcc mod Pow2B[NDB + 1];
+                            BrAcc := BrAcc div Pow2B[NDB + 1];
+                            BrCnt -= NDB;
+                            Dist := ((2 + (X div Pow2B[NPostfix + 1]) mod 2) * Pow2B[NDB + 1] - 4 + E) * Pow2B[NPostfix + 1] +
                                 X mod Pow2B[NPostfix + 1] + NDirect + 1;
                         end;
                 end;
-                FlushLiteral();
-                Total := OutDropped + OutTB.Length();
+                // HOT-INLINE copy of FlushLiteral
+                if LitPend >= 0 then begin
+                    OutTB.Append(CharTbl[LitPend + 1]);
+                    LitPend := -1;
+                end;
+                OutLen := OutTB.Length();
+                Total := OutDropped + OutLen;
                 MaxDist := MaxBack;
                 if Total < MaxDist then
                     MaxDist := Total;
@@ -2732,12 +2820,20 @@ codeunit 51160 "TOO Brotli Data Compression"
                         Rb[RbIdx + 1] := Dist;
                         RbIdx := (RbIdx + 1) mod 4;
                     end;
-                    CopyMatch(Dist, CopyLen);
+                    if Dist >= CopyLen then begin
+                        // HOT-INLINE copy of CopyMatch (no overlap) : one ToText + Append ; Dist <= OutLen (window keeps MaxBack)
+                        Chunk := OutTB.ToText(OutLen - Dist + 1, CopyLen);
+                        OutTB.Append(Chunk);
+                        P1 := Chunk[CopyLen];
+                        P2 := Chunk[CopyLen - 1];
+                    end else
+                        CopyMatch(Dist, CopyLen);
                     Produced += CopyLen;
+                    OutLen += CopyLen;
                 end;
                 if Produced > MLen then
                     Error(CorruptErr);
-                if OutTB.Length() > MaxBack + 4194304 then
+                if OutLen > MaxBack + 4194304 then
                     SlideWindow();
             end;
         end;
@@ -3355,18 +3451,13 @@ codeunit 51160 "TOO Brotli Data Compression"
     #endregion
 
     #region Decompress : bit reader
-    /// <summary>LSB-first container : bytes loaded while <= 48 bits are held (past the input end : zero bytes).</summary>
+    /// <summary>LSB-first container : 3 bytes per step while <= 32 bits are held (>= 33 after) ; past the input end the 16 guard chars (0) of Decompress are read.</summary>
     local procedure Refill()
-    var
-        C: Integer;
     begin
-        while BrCnt <= 48 do begin
-            if InPos <= InLen then begin
-                C := InText[InPos];
-                BrAcc += C * Pow2B[BrCnt + 1];
-            end;
-            InPos += 1;
-            BrCnt += 8;
+        while BrCnt <= 32 do begin
+            BrAcc += (InText[InPos] + InText[InPos + 1] * 256 + InText[InPos + 2] * 65536) * Pow2B[BrCnt + 1];
+            InPos += 3;
+            BrCnt += 24;
         end;
     end;
 

@@ -98,6 +98,9 @@ public sealed class ALTextBuilder
 
 public static class ALRt
 {
+    // statement / call counters per procedure (al2cs.py --count) : AL StmtHit model
+    public static readonly long[] S = new long[512], Calls = new long[512];
+    public static bool H(int pid) { S[pid]++; return true; }
     public static int I(long v) => checked((int)v);
     public static long L(long v) => v;
     public static ALChar C(long v) => new ALChar(checked((int)v));

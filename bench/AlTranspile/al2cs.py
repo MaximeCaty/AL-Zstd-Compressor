@@ -117,8 +117,15 @@ def cs_str(s):
 
 # ----------------------------------------------------------------------------------------------------------- codeunit
 class Tr:
-    def __init__(self, enums):
+    def __init__(self, enums, count=False):
         self.globals = {}; self.procs = {}; self.out = []; self.tmp = 0; self.enums = enums
+        self.count = count; self.pnames = []; self.pid = 0
+
+    def hit(self):  # statement counter (AL StmtHit) of the current procedure, as a C# bool term
+        return f"ALRt.H({self.pid}) & " if self.count else ""
+
+    def cnt(self, pad):
+        return [pad + f"ALRt.S[{self.pid}]++;"] if self.count else []
 
     def fresh(self):
         self.tmp += 1; return f"__t{self.tmp}"
@@ -182,6 +189,8 @@ class Tr:
                 o.append(f"    public {cs_type(t)} {name} = {cs_init(t)};")
         for pr in procs:
             self.emit_proc(*pr)
+        names = ', '.join('"' + n + '"' for n in self.pnames)
+        o.append(f"    public static readonly string[] ProcNames = {{ {names} }};")
         o.append("}")
         return "\n".join(o)
 
@@ -196,6 +205,9 @@ class Tr:
             ps.append(f"{ref}{cs_type(pt)} {pn}")
         rt = cs_type(ret) if ret else 'void'
         self.out.append(f"    public {rt} {name}({', '.join(ps)})\n    {{")
+        self.pid = len(self.pnames); self.pnames.append(name)
+        if self.count:
+            self.out.append(f"        ALRt.Calls[{self.pid}]++;")
         for ln, lt in locs:
             self.scope[ln.lower()] = (ln, lt)
             self.out.append(f"        {cs_type(lt)} {ln} = {cs_init(lt)};")
@@ -236,7 +248,7 @@ class Tr:
             return [pad + '{'] + s + [pad + '}']
         if w == 'if':
             p.next(); c = self.expr(p); p.expect('then')
-            res = [pad + f"if ({c})"]
+            res = [pad + f"if ({self.hit()}({c}))"]
             if p.v() == 'else':
                 res += [pad + '{', pad + '}']
             else:
@@ -246,16 +258,16 @@ class Tr:
             return res
         if w == 'while':
             p.next(); c = self.expr(p); p.expect('do')
-            return [pad + f"while ({c})"] + self.block(p, ind)
+            return [pad + f"while ({self.hit()}({c}))"] + self.block(p, ind)
         if w == 'repeat':
             p.next(); s = self.stmts(p, ('until',), ind + 1); p.expect('until'); c = self.expr(p)
-            return [pad + 'do', pad + '{'] + s + [pad + f"}} while (!({c}));"]
+            return [pad + 'do', pad + '{'] + s + [pad + f"}} while (!({self.hit()}({c})));"]
         if w == 'for':
             p.next(); var = p.next()[1]; p.expect(':='); a = self.expr(p)
             down = p.v() == 'downto'; p.next(); b = self.expr(p); p.expect('do')
             t = self.fresh(); vn, vt = self.lookup(var)
             head = [pad + '{', pad + f"    long {t} = {b};",
-                    pad + f"    for ({vn} = ALRt.I({a}); {vn} {'>=' if down else '<='} {t}; {vn}{'--' if down else '++'})"]
+                    pad + f"    for ({vn} = ALRt.I({a}); {self.hit()}({vn} {'>=' if down else '<='} {t}); {vn}{'--' if down else '++'})"]
             return head + self.block(p, ind + 1) + [pad + '}']
         if w == 'foreach':
             p.next(); var = p.next()[1]; p.expect('in'); coll = self.expr(p); p.expect('do')
@@ -264,7 +276,7 @@ class Tr:
         if w == 'case':
             p.next(); e = self.expr(p); p.expect('of')
             t = self.fresh()
-            res = [pad + '{', pad + f"    var {t} = {e};"]
+            res = [pad + '{'] + self.cnt(pad + '    ') + [pad + f"    var {t} = {e};"]
             first = True
             while p.v() not in ('end', 'else'):
                 vals = [self.expr(p)]
@@ -284,10 +296,10 @@ class Tr:
             p.next()
             if p.accept('('):
                 e = self.expr(p); p.expect(')')
-                return [pad + f"return {conv(self.ret, e)};"]
-            return [pad + (f"return {self.retname};" if self.retname else "return;")]
+                return self.cnt(pad) + [pad + f"return {conv(self.ret, e)};"]
+            return self.cnt(pad) + [pad + (f"return {self.retname};" if self.retname else "return;")]
         if w == 'break':
-            p.next(); return [pad + 'break;']
+            p.next(); return self.cnt(pad) + [pad + 'break;']
         # assignment or call
         lhs_i = p.i
         lhs = self.expr(p, lvalue=True)
@@ -298,9 +310,9 @@ class Tr:
             if op != ':=':
                 rhs = f"{lhs} {op[0]} ({rhs})"
             if ischar:
-                return [pad + f"{lhs} = ALRt.C({rhs});"]
-            return [pad + f"{lhs} = {conv(t, rhs)};"]
-        return [pad + lhs + ';']
+                return self.cnt(pad) + [pad + f"{lhs} = ALRt.C({rhs});"]
+            return self.cnt(pad) + [pad + f"{lhs} = {conv(t, rhs)};"]
+        return self.cnt(pad) + [pad + lhs + ';']
 
     def lookup(self, name):
         k = name.lower()
@@ -454,6 +466,7 @@ def enums(files):
 
 if __name__ == '__main__':
     src = open(sys.argv[1], encoding='utf-8').read()
-    ens = enums(sys.argv[2:])
-    code = Tr(ens).run(src)
+    count = '--count' in sys.argv
+    ens = enums([a for a in sys.argv[2:] if a != '--count'])
+    code = Tr(ens, count).run(src)
     print(code.replace("namespace AlGen;", "namespace AlGen;\n" + "\n".join(ens), 1))
