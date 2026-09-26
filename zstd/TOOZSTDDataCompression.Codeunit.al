@@ -84,6 +84,9 @@ codeunit 51150 "TOO ZSTD Data Compression"
         // 2-symbol table : same window decodes 2 literals when the 2nd code fits in the bits left (0 = single only)
         HufPair: array[2048] of Text[2];
         HufPairBits: array[2048] of Integer;
+        HufTxt: array[2048] of Text[2]; // [U + 1] : the pair when it fits, else the single symbol (DecodeHufStream fast loop)
+        HufNb: array[2048] of Integer; // bits of HufTxt
+        HufCnt: array[2048] of Integer; // symbols of HufTxt (1 or 2)
         HufMaxBits: Integer;
         HufValid: Boolean;
         Weights: array[256] of Integer; // [S + 1]
@@ -906,12 +909,18 @@ codeunit 51150 "TOO ZSTD Data Compression"
         for U := 0 to Pow2B[HufMaxBits + 1] - 1 do begin
             HufPairBits[U + 1] := 0;
             NB := HufBits[U + 1];
+            HufTxt[U + 1] := HufChar[U + 1];
+            HufNb[U + 1] := NB;
+            HufCnt[U + 1] := 1;
             Rest := HufMaxBits - NB;
             if Rest > 0 then begin
                 B := (U mod Pow2B[Rest + 1]) * Pow2B[NB + 1];
                 if HufBits[B + 1] <= Rest then begin
                     HufPair[U + 1] := HufChar[U + 1] + HufChar[B + 1];
                     HufPairBits[U + 1] := NB + HufBits[B + 1];
+                    HufTxt[U + 1] := HufPair[U + 1];
+                    HufNb[U + 1] := HufPairBits[U + 1];
+                    HufCnt[U + 1] := 2;
                 end;
             end;
         end;
@@ -966,6 +975,26 @@ codeunit 51150 "TOO ZSTD Data Compression"
     begin
         BitInitBack(Start, Size);
         I := 1;
+        // fast loop : 2 lookups per refill test (<= 2 x 11 bits), 4 bytes per refill, no trim of the container per code
+        // (a code is read at bit BrAvail from the bottom : div + mod), <= 4 symbols per loop. It stops 4 bytes before the
+        // stream start and 3 symbols before Count ; the careful loop below ends the stream
+        while (I + 3 <= Count) and (BrPos - 3 >= BrStart) do begin
+            if BrAvail < 22 then begin
+                BrContainer := (BrContainer mod Pow2B[BrAvail + 1]) * 4294967296L + InText[BrPos] * 16777216L + InText[BrPos - 1] * 65536 +
+                    InText[BrPos - 2] * 256 + InText[BrPos - 3];
+                BrPos -= 4;
+                BrAvail += 32;
+            end;
+            Idx := (BrContainer div Pow2B[BrAvail - HufMaxBits + 1]) mod Pow2B[HufMaxBits + 1];
+            HufTB.Append(HufTxt[Idx + 1]);
+            I += HufCnt[Idx + 1];
+            BrAvail -= HufNb[Idx + 1];
+            Idx := (BrContainer div Pow2B[BrAvail - HufMaxBits + 1]) mod Pow2B[HufMaxBits + 1];
+            HufTB.Append(HufTxt[Idx + 1]);
+            I += HufCnt[Idx + 1];
+            BrAvail -= HufNb[Idx + 1];
+        end;
+        BrContainer := BrContainer mod Pow2B[BrAvail + 1];
         while I <= Count do begin
             while (BrAvail <= 48) and (BrPos >= BrStart) do begin
                 C := InText[BrPos];
@@ -1012,9 +1041,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
         SeqCount: Integer;
         Modes: Integer;
         N: Integer;
-        C: Integer;
         NB: Integer;
-        Sh: Integer;
         LLState: Integer;
         OFState: Integer;
         MLState: Integer;
@@ -1064,42 +1091,67 @@ codeunit 51150 "TOO ZSTD Data Compression"
                 // no per-sequence code range check : SetupTable bounds every symbol (RLE byte checked, predefined and
                 // FSE tables built for symbols <= MaxSymbol 35 / 31 / 52)
 
-                // extra bits : OF, ML, LL (each read = refill + div / mod on the container)
-                while (BrAvail <= 48) and (BrPos >= BrStart) do begin
-                    C := InText[BrPos];
-                    BrContainer := BrContainer * 256 + C;
-                    BrPos -= 1;
-                    BrAvail += 8;
+                // extra bits : OF, ML, LL. HOT-INLINE bit reads : the container is trimmed only when refilled (<= 62 bits,
+                // 4 then 2 bytes per statement), a field is read at bit BrAvail from the bottom (div + mod)
+                if BrAvail <= 30 then
+                    if BrPos - 3 >= BrStart then begin
+                        BrContainer := (BrContainer mod Pow2B[BrAvail + 1]) * 4294967296L + InText[BrPos] * 16777216L +
+                            InText[BrPos - 1] * 65536 + InText[BrPos - 2] * 256 + InText[BrPos - 3];
+                        BrPos -= 4;
+                        BrAvail += 32;
+                    end;
+                if BrAvail < 47 then
+                    if BrPos - 1 >= BrStart then begin
+                        BrContainer := (BrContainer mod Pow2B[BrAvail + 1]) * 65536 + InText[BrPos] * 256 + InText[BrPos - 1];
+                        BrPos -= 2;
+                        BrAvail += 16;
+                    end;
+                if BrAvail < 47 then begin
+                    // stream start : byte by byte
+                    BrContainer := BrContainer mod Pow2B[BrAvail + 1];
+                    while (BrAvail < 47) and (BrPos >= BrStart) do begin
+                        BrContainer := BrContainer * 256 + InText[BrPos];
+                        BrPos -= 1;
+                        BrAvail += 8;
+                    end;
                 end;
-                if BrAvail < OFCode then
-                    Error(CorruptErr);
-                Sh := BrAvail - OFCode;
-                OfValue := Pow2B[OFCode + 1] + BrContainer div Pow2B[Sh + 1];
-                BrContainer := BrContainer mod Pow2B[Sh + 1];
-                BrAvail := Sh;
-
-                // no refill : >= 49 bits after the OF refill unless the stream ends, OF <= 31 + ML <= 16
+                // OF <= 31 + ML <= 16 bits : >= 47 after the refill unless the stream ends
                 NB := MLBits[MLCode + 1];
-                if BrAvail < NB then
+                if BrAvail < OFCode + NB then
                     Error(CorruptErr);
-                Sh := BrAvail - NB;
-                ML := MLBase[MLCode + 1] + BrContainer div Pow2B[Sh + 1];
-                BrContainer := BrContainer mod Pow2B[Sh + 1];
-                BrAvail := Sh;
+                BrAvail -= OFCode;
+                OfValue := Pow2B[OFCode + 1] + (BrContainer div Pow2B[BrAvail + 1]) mod Pow2B[OFCode + 1];
+                BrAvail -= NB;
+                ML := MLBase[MLCode + 1] + (BrContainer div Pow2B[BrAvail + 1]) mod Pow2B[NB + 1];
 
-                while (BrAvail <= 48) and (BrPos >= BrStart) do begin
-                    C := InText[BrPos];
-                    BrContainer := BrContainer * 256 + C;
-                    BrPos -= 1;
-                    BrAvail += 8;
+                if BrAvail <= 30 then
+                    if BrPos - 3 >= BrStart then begin
+                        BrContainer := (BrContainer mod Pow2B[BrAvail + 1]) * 4294967296L + InText[BrPos] * 16777216L +
+                            InText[BrPos - 1] * 65536 + InText[BrPos - 2] * 256 + InText[BrPos - 3];
+                        BrPos -= 4;
+                        BrAvail += 32;
+                    end;
+                if BrAvail < 42 then
+                    if BrPos - 1 >= BrStart then begin
+                        BrContainer := (BrContainer mod Pow2B[BrAvail + 1]) * 65536 + InText[BrPos] * 256 + InText[BrPos - 1];
+                        BrPos -= 2;
+                        BrAvail += 16;
+                    end;
+                if BrAvail < 42 then begin
+                    // stream start : byte by byte
+                    BrContainer := BrContainer mod Pow2B[BrAvail + 1];
+                    while (BrAvail < 42) and (BrPos >= BrStart) do begin
+                        BrContainer := BrContainer * 256 + InText[BrPos];
+                        BrPos -= 1;
+                        BrAvail += 8;
+                    end;
                 end;
+                // LL <= 16 + 3 states <= 26 bits : >= 42 after the refill unless the stream ends
                 NB := LLBits[LLCode + 1];
                 if BrAvail < NB then
                     Error(CorruptErr);
-                Sh := BrAvail - NB;
-                LL := LLBase[LLCode + 1] + BrContainer div Pow2B[Sh + 1];
-                BrContainer := BrContainer mod Pow2B[Sh + 1];
-                BrAvail := Sh;
+                BrAvail -= NB;
+                LL := LLBase[LLCode + 1] + (BrContainer div Pow2B[BrAvail + 1]) mod Pow2B[NB + 1];
 
                 // offset : > 3 = new offset, else repeat code (shifted by one when LL = 0)
                 if OfValue > 3 then begin
@@ -1140,24 +1192,14 @@ codeunit 51150 "TOO ZSTD Data Compression"
                 // states : LL, ML, OF (none after the last sequence) ; <= 26 bits, no refill : >= 49 after the LL refill
                 // unless the stream ends, LL <= 16
                 if N < SeqCount then begin
-                    NB := DNbBits[LLState + 1] + DNbBits[1025 + MLState] + DNbBits[513 + OFState];
-                    if BrAvail < NB then
+                    if BrAvail < DNbBits[LLState + 1] + DNbBits[1025 + MLState] + DNbBits[513 + OFState] then
                         Error(CorruptErr);
-                    NB := DNbBits[LLState + 1];
-                    Sh := BrAvail - NB;
-                    LLState := DBase[LLState + 1] + BrContainer div Pow2B[Sh + 1];
-                    BrContainer := BrContainer mod Pow2B[Sh + 1];
-                    BrAvail := Sh;
-                    NB := DNbBits[1025 + MLState];
-                    Sh := BrAvail - NB;
-                    MLState := DBase[1025 + MLState] + BrContainer div Pow2B[Sh + 1];
-                    BrContainer := BrContainer mod Pow2B[Sh + 1];
-                    BrAvail := Sh;
-                    NB := DNbBits[513 + OFState];
-                    Sh := BrAvail - NB;
-                    OFState := DBase[513 + OFState] + BrContainer div Pow2B[Sh + 1];
-                    BrContainer := BrContainer mod Pow2B[Sh + 1];
-                    BrAvail := Sh;
+                    BrAvail -= DNbBits[LLState + 1];
+                    LLState := DBase[LLState + 1] + (BrContainer div Pow2B[BrAvail + 1]) mod Pow2B[DNbBits[LLState + 1] + 1];
+                    BrAvail -= DNbBits[1025 + MLState];
+                    MLState := DBase[1025 + MLState] + (BrContainer div Pow2B[BrAvail + 1]) mod Pow2B[DNbBits[1025 + MLState] + 1];
+                    BrAvail -= DNbBits[513 + OFState];
+                    OFState := DBase[513 + OFState] + (BrContainer div Pow2B[BrAvail + 1]) mod Pow2B[DNbBits[513 + OFState] + 1];
                 end;
 
                 // execute : LL literals, then ML bytes from Offset back
@@ -1189,6 +1231,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
             end;
             if (BrAvail <> 0) or (BrPos >= BrStart) then
                 Error(CorruptErr);
+            BrContainer := 0;
         end;
 
         // last literals

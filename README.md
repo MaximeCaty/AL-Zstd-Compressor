@@ -46,12 +46,12 @@ environment (on the BC profile of a Brotli roundtrip, BC ran at ~0.85x this mode
 
 | | Encode Fast | Encode Medium | Encode Heavy | Decode |
 |---|---|---|---|---|
-| zstd | ~250 ms | ~515 ms | ~625 ms | ~110-125 ms |
+| zstd | ~250 ms | ~515 ms | ~625 ms | ~70-80 ms |
 | Brotli | ~275 ms | ~540 ms | ~650 ms | ~85-95 ms |
 
 - **zstd:** its frames open in Windows Explorer and the zstd CLI.
 - **Brotli:** 2-5 points smaller, most of all on binary and structured data, because it codes each literal with the
-  context of the 2 previous bytes. It encodes ~5 % slower than zstd and decodes ~20 % faster. Its streams open with .NET
+  context of the 2 previous bytes. It encodes ~5 % slower than zstd and decodes ~15 % slower. Its streams open with .NET
   `BrotliStream`, browsers and the brotli CLI.
 - Every level is slower than GZip: these codecs trade speed for size.
 
