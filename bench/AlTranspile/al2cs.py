@@ -268,8 +268,9 @@ class Tr:
             p.next(); var = p.next()[1]; p.expect(':='); a = self.expr(p)
             down = p.v() == 'downto'; p.next(); b = self.expr(p); p.expect('do')
             t = self.fresh(); vn, vt = self.lookup(var)
-            head = [pad + '{', pad + f"    long {t} = {b};",
-                    pad + f"    for ({vn} = ALRt.I({a}); {self.hit(ln)}({vn} {'>=' if down else '<='} {t}); {vn}{'--' if down else '++'})"]
+            # BC counts a for statement once (StmtHit before the loop), not its test per iteration
+            head = [pad + '{'] + self.cnt(pad + '    ', ln) + [pad + f"    long {t} = {b};",
+                    pad + f"    for ({vn} = ALRt.I({a}); ({vn} {'>=' if down else '<='} {t}); {vn}{'--' if down else '++'})"]
             return head + self.block(p, ind + 1) + [pad + '}']
         if w == 'foreach':
             p.next(); var = p.next()[1]; p.expect('in'); coll = self.expr(p); p.expect('do')
