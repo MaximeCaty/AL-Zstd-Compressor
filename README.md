@@ -40,17 +40,18 @@ profile:
 | zstd | -4.1 % | -12.5 % | -13.5 % | -9.9 % | ~-3 % |
 | Brotli | -6.7 % | -14.9 % | -15.9 % | -15.6 % | ~-6 % |
 
-AL time per MB. For zstd, encode comes from the time model below and decode from BC measurements; Brotli uses the C#
-model with the same unit costs:
+AL time per MB of the full-size files of this corpus (53 MB), General profile, from the transpiled codeunits
+(`bench/AlTranspile`: 20 ns per AL statement, 450 ns per call). Absolute times depend on the data and on the BC
+environment (on the BC profile of a Brotli roundtrip, BC ran at ~0.85x this model), so compare the cells with each other:
 
-| | Encode Medium | Encode Heavy | Decode |
-|---|---|---|---|
-| zstd | ~180-220 ms | ~230-280 ms | ~30-60 ms |
-| Brotli | ~330 ms | ~385 ms | ~75 ms |
+| | Encode Fast | Encode Medium | Encode Heavy | Decode |
+|---|---|---|---|---|
+| zstd | ~250 ms | ~515 ms | ~625 ms | ~110-125 ms |
+| Brotli | ~275 ms | ~540 ms | ~650 ms | ~85-95 ms |
 
-- **zstd:** faster; its frames open in Windows Explorer and the zstd CLI.
+- **zstd:** its frames open in Windows Explorer and the zstd CLI.
 - **Brotli:** 2-5 points smaller, most of all on binary and structured data, because it codes each literal with the
-  context of the 2 previous bytes. It is ~1.4x slower to encode and ~1.2x slower to decode. Its streams open with .NET
+  context of the 2 previous bytes. It encodes ~5 % slower than zstd and decodes ~20 % faster. Its streams open with .NET
   `BrotliStream`, browsers and the brotli CLI.
 - Every level is slower than GZip: these codecs trade speed for size.
 
@@ -71,16 +72,20 @@ model with the same unit costs:
   | `TextBuilder.Append` | ~70 ns |
 
   So the hot loops keep inline copies of helpers (`// HOT-INLINE`), bytes live as Latin-1 chars, copies are bulk
-  `Substring` / `ToText`, and bits go 2 bytes per `Append`.
-- zstd encode time model (7 BC runs, ±2.4 %), counters in thousands per raw MB: `ms/MB ≈ 45 + 0.079·inserts +
-  0.364·positions + 0.041·candidates + 0.0076·bytes`.
+  `Substring` / `ToText`, bits go 2 bytes per `Append`, and match extensions compare 4 bytes per statement against 4
+  guard chars past the input. `bench/AlTranspile` counts the statements of each procedure and AL line to find what to
+  cut; its ranking matches the BC profiler.
 - The parser settings of each level and profile, and the measurements behind them, are documented in the codeunits
   (`ApplyLevel`, `ApplyGeneralProfile`).
 
 ## Testing
 
 - **zstd:** every speed pass was checked byte for byte against a reference copy and with `zstd -t` / `zstd -d`; the C#
-  port (`bench/ZstdAlPort`) round-trips its corpus through `zstd -d`.
+  port (`bench/ZstdAlPort`) round-trips its corpus through `zstd -d`. The codeunit also runs transpiled to C#
+  (`bench/AlTranspile/zstd/run.sh`): its frames are checked with `zstd -d`, and the AL `Decompress` reads ~300 real zstd
+  frames (levels 1-19).
 - **Brotli:** the AL codeunit is transpiled to C# (`bench/AlTranspile/run.sh`). Its streams are decoded by .NET
-  `BrotliDecoder` and by the AL `Decompress`, and the AL `Decompress` decodes ~190 real Brotli streams. It has not been
-  run in BC yet.
+  `BrotliDecoder` and by the AL `Decompress`, and the AL `Decompress` reads ~300 real Brotli streams (q1-q11, windows
+  16-24). It was profiled in BC on a 9.6 MB MySQL dump roundtrip.
+- `--hashes` (both harnesses) compares the bytes written by two versions: speed passes that must not change the output
+  are checked on ~560 streams per codec.

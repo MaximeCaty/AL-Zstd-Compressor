@@ -2,7 +2,8 @@
 
 `ZstdAlPort/ZstdAlEncoder.cs` ports the **Compress** side of `zstd/TOOZSTDDataCompression.Codeunit.al`, both profiles, to plain C#. It keeps AL
 1-based indexing and statement order line for line, so the output bytes should match the AL, and it lets parser settings be
-measured off-BC before they are ported back. Counters feed the AL time model of the root README (ms per raw MB).
+measured off-BC before they are ported back. Its counters feed an AL time model (ms per raw MB) fitted on BC runs
+before the parser speed pass of 2026-09; `AlTranspile` now counts the statements of the codeunits themselves.
 
 `Program.cs` compares it with GZip (`GZipStream`, the same engine as BC `Data Compression`.GZipCompress; `gz-opt` = BC
 default) and with reference `zstd` CLI levels. Every AL frame is checked with `zstd -d`.
@@ -84,10 +85,21 @@ encode ~385 ms/MB (zstd ~277), decode ~73 ms/MB (zstd ~60, same unit costs). Wit
 - stubs for DotNet_StreamReader / Writer, Temp Blob and NavApp.
 
 `run.sh <files>` transpiles `brotli/TOOBrotliDataCompression.Codeunit.al` and tests it. The AL streams are checked with
-.NET `BrotliDecoder` and the AL `Decompress`, and the AL `Decompress` also reads real Brotli streams. `--debug-pair A B`
-compares a fresh codeunit instance with a reused one, which is how the SingleInstance state bug in the context
-clustering was found.
+.NET `BrotliDecoder` and the AL `Decompress`, and the AL `Decompress` also reads real Brotli streams (q1, q5, q9, q11).
+`--real-window 16 <files>` decodes real streams with a small window, which exercises the sliding output window and the
+dictionary references past it. `zstd/run.sh <files>` does the same for `zstd/TOOZSTDDataCompression.Codeunit.al`: its
+frames are checked with `zstd -d` and the AL `Decompress`, which also reads real zstd frames (-1, -3, -9, -19).
+`--debug-pair A B` compares a fresh codeunit instance with a reused one, which is how the SingleInstance state bug in the
+context clustering was found.
 
-`COUNT=1 AlTranspile/run.sh --profile-run <file> [Level] [Profile]` runs one roundtrip with a counter per AL statement
-and per procedure call, and prints each procedure's cost in the AL time model (20 ns per statement, 450 ns per call).
-It gives the same ranking as the BC profiler; its absolute times read ~1.5-2x high on the tightest loops.
+Output identity: `--hashes <files>` (both harnesses) prints the size and SHA-256 of every stream at the 3 levels x 2
+profiles. A speed change that must keep the output is checked by comparing this list before and after it.
+
+Time model: build with `COUNT=1` (counters per AL statement, per procedure call and per AL source line).
+- `--profile-run <file> [Level] [Profile]`: cost of each procedure at 20 ns per statement and 450 ns per call.
+  `PROFILE_LINES=n` lists the n hottest AL lines (Brotli), `PROFILE_DUMP=<prefix>` writes the count of every line.
+- `--profile-corpus <Level> <Profile> <files>`: ms per MB of compress and decompress over a file set, plus the Text
+  reads and array accesses per MB (not in the ms figure).
+
+It ranks procedures like the BC profiler. On the BC profile of a 9.6 MB MySQL dump roundtrip (Brotli Medium ColumnData),
+BC ran at ~0.85x the model.
