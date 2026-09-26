@@ -75,3 +75,15 @@ A Brotli (RFC 7932) encoder and decoder written AL-style, with statement counts.
 Corpus results (54 MB, Heavy parse): -15.9 % vs GZip (zstd AL -13.3 %, real Brotli q9 -17.9 %). Modelled AL speed:
 encode ~385 ms/MB (zstd ~277), decode ~73 ms/MB (zstd ~60, same unit costs). With the Medium parse: -14.9 %, encode
 ~333 ms/MB.
+
+## AL -> C# transpiler (`AlTranspile/`)
+
+`al2cs.py` turns an AL codeunit into C# that behaves like AL:
+- 1-based arrays and Text with bound checks;
+- checked Integer arithmetic, and `and` / `or` evaluating both sides;
+- stubs for DotNet_StreamReader / Writer, Temp Blob and NavApp.
+
+`run.sh <files>` transpiles `brotli/TOOBrotliDataCompression.Codeunit.al` and tests it. The AL streams are checked with
+.NET `BrotliDecoder` and the AL `Decompress`, and the AL `Decompress` also reads real Brotli streams. `--debug-pair A B`
+compares a fresh codeunit instance with a reused one, which is how the SingleInstance state bug in the context
+clustering was found.
