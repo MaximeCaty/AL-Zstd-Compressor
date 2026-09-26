@@ -27,8 +27,9 @@ public sealed class Stats
     public long RawBytes;
     // entropy stage breakdown (emitted compressed blocks) : sizes in bytes, ideal = order-0 Shannon bits
     public long Blocks, Lits, LitBytes, Seqs, SeqHdrBytes, SeqBytes; public double LitIdealBits, SeqIdealBits;
+    public double BrLitBytes; // literals re-coded with brotli-style context modeling (estimate, see BrotliLit)
 
-    public void Add(Stats o) { Blocks += o.Blocks; Lits += o.Lits; LitBytes += o.LitBytes; Seqs += o.Seqs; SeqHdrBytes += o.SeqHdrBytes; SeqBytes += o.SeqBytes; LitIdealBits += o.LitIdealBits; SeqIdealBits += o.SeqIdealBits; Inserts += o.Inserts; Positions += o.Positions; Candidates += o.Candidates; Bytes += o.Bytes; RawBytes += o.RawBytes; }
+    public void Add(Stats o) { BrLitBytes += o.BrLitBytes; Blocks += o.Blocks; Lits += o.Lits; LitBytes += o.LitBytes; Seqs += o.Seqs; SeqHdrBytes += o.SeqHdrBytes; SeqBytes += o.SeqBytes; LitIdealBits += o.LitIdealBits; SeqIdealBits += o.SeqIdealBits; Inserts += o.Inserts; Positions += o.Positions; Candidates += o.Candidates; Bytes += o.Bytes; RawBytes += o.RawBytes; }
 
     /// <summary>README time model, AL ms for the counted input.</summary>
     public double EstimatedAlMs()
@@ -116,6 +117,7 @@ public sealed class ZstdAlEncoder
     readonly int[] HistCount = new int[257], SeqHist = new int[193], Cumul = new int[258], TableSymbol = new int[513];
 
     public Stats Stats = new();
+    public bool BrotliEstimate;
 
     static readonly int[] LLBaseTok = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
     static readonly int[] LLBitsTok = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
@@ -356,6 +358,7 @@ public sealed class ZstdAlEncoder
         Stats.Blocks++; Stats.Lits += LitCount; Stats.LitBytes += litBytes; Stats.Seqs += NbSeq;
         Stats.SeqBytes += BlockTB.Length - litBytes; Stats.SeqHdrBytes += SeqHdrEnd - litBytes;
         Stats.LitIdealBits += Entropy(Lit, 1, LitCount);
+        if (BrotliEstimate) Stats.BrLitBytes += litBytes * BrotliLit.Ratio(T, start, NbSeq, SeqLL, SeqML, LitCount);
         if (NbSeq > 0) Stats.SeqIdealBits += SeqIdeal();
         PutBlockHeader(lastBlock, 2, BlockTB.Length);
         OutTB.Append(BlockTB.ToArray());

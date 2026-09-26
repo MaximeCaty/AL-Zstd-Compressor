@@ -51,3 +51,11 @@ slower than the zstd codec.
   recency list, and bzip2 multi-table Huffman. The decoder fills Next during decoding (1 statement per run byte) and walks
   it 2 bytes per append. Corpus result (K = 16): -21.4 % vs GZip (bzip2 -22.1 %, zstd Heavy -13.3 %), encode ~2.1 s/MB,
   decode ~0.34 s/MB (0.17-0.43 on compressible files).
+
+## Brotli estimate (`--brotli`, `BrotliLit.cs`)
+
+Re-codes the literals of the AL zstd parse with brotli-style literal context modeling: 64 contexts from the 2
+previous bytes, 4 modes, greedy clustering into trees. It reports the size that would give, plus the literals and
+commands per byte that drive the AL decoder cost model. Corpus result (Heavy parse): zstd -13.3 % vs GZip, with
+context-modeled literals -15.3 % (binary DB -9.9 → -14.9 %, files ≤ 256 KB -3.3 → -5.7 %). Real brotli q9 reaches -17.9 %;
+the rest is its static dictionary and command coding.
