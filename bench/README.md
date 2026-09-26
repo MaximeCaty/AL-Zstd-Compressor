@@ -87,3 +87,7 @@ encode ~385 ms/MB (zstd ~277), decode ~73 ms/MB (zstd ~60, same unit costs). Wit
 .NET `BrotliDecoder` and the AL `Decompress`, and the AL `Decompress` also reads real Brotli streams. `--debug-pair A B`
 compares a fresh codeunit instance with a reused one, which is how the SingleInstance state bug in the context
 clustering was found.
+
+`COUNT=1 AlTranspile/run.sh --profile-run <file> [Level] [Profile]` runs one roundtrip with a counter per AL statement
+and per procedure call, and prints each procedure's cost in the AL time model (20 ns per statement, 450 ns per call).
+It gives the same ranking as the BC profiler; its absolute times read ~1.5-2x high on the tightest loops.

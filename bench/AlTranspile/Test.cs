@@ -10,6 +10,38 @@ using AlGen;
     dotnet run -- <resource folder> <file or dir>... [--levels Fast,Medium,Heavy] [--profile ColumnData]
 */
 NavApp.ResourceFolder = args[0];
+if (args.Length > 2 && args[1] == "--profile-run")
+{
+    // one roundtrip of args[2] : statements / calls per procedure (build with COUNT=1 run.sh), AL time model
+    // ms = statements x StmtNs + calls x CallNs ; defaults 20 / 450 ns (README), override with args[5] / args[6]
+    var d = File.ReadAllBytes(args[2]);
+    var lvl = args.Length > 3 ? Enum.Parse<TOO_Brotli_Level>(args[3]) : TOO_Brotli_Level.Medium;
+    var prof = args.Length > 4 ? Enum.Parse<TOO_Brotli_Profile>(args[4]) : TOO_Brotli_Profile.ColumnData;
+    double sNs = args.Length > 5 ? double.Parse(args[5], System.Globalization.CultureInfo.InvariantCulture) : 20;
+    double cNs = args.Length > 6 ? double.Parse(args[6], System.Globalization.CultureInfo.InvariantCulture) : 450;
+    var c = new TOO_Brotli_Data_Compression();
+    c.Compress(ALInStream.Of(new byte[] { 1, 2, 3 }), new ALOutStream(), lvl, prof); // one-time tables out of the count
+    Array.Clear(ALRt.S); Array.Clear(ALRt.Calls);
+    var o = new ALOutStream();
+    c.Compress(ALInStream.Of(d), o, lvl, prof);
+    var z = o.Buf.ToArray();
+    var encS = (long[])ALRt.S.Clone(); var encC = (long[])ALRt.Calls.Clone();
+    Array.Clear(ALRt.S); Array.Clear(ALRt.Calls);
+    var back = AlDecode(c, z);
+    if (!back.AsSpan().SequenceEqual(d)) throw new Exception("roundtrip failed");
+    Console.WriteLine($"{Path.GetFileName(args[2])} {d.Length} B -> {z.Length} B ({100.0 * z.Length / d.Length:F2} %), {lvl} {prof}");
+    foreach (var (title, st, ca) in new[] { ("Compress", encS, encC), ("Decompress", ALRt.S, ALRt.Calls) })
+    {
+        double sum = 0;
+        var rows = new List<(string, long, long, double)>();
+        for (int i = 0; i < TOO_Brotli_Data_Compression.ProcNames.Length; i++)
+            if (st[i] + ca[i] > 0) { double ms = (st[i] * sNs + ca[i] * cNs) / 1e6; sum += ms; rows.Add((TOO_Brotli_Data_Compression.ProcNames[i], st[i], ca[i], ms)); }
+        Console.WriteLine($"-- {title} : ~{sum:F0} ms ({sum / (d.Length / 1048576.0):F0} ms/MB)");
+        foreach (var r in rows.OrderByDescending(r => r.Item4).Take(14))
+            Console.WriteLine($"   {r.Item1,-22}{r.Item2,14:N0} stmt {r.Item3,11:N0} calls {r.Item4,8:F0} ms");
+    }
+    return;
+}
 if (args.Length > 3 && args[1] == "--debug-pair")
 {
     // compress B with a fresh instance and after A with the same instance : compare
